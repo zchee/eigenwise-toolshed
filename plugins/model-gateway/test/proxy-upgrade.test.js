@@ -214,3 +214,48 @@ test('GH-380: installScope reads a model-gateway installed from another marketpl
   writeForkRegistry(home, [{ scope: 'project', version: '0.1.0' }, { scope: 'user', version: '0.1.0' }]);
   assert.equal(commands.installScope(home), 'user');
 });
+
+// Claude Code moved the install registry into CLAUDE_CODE_PLUGIN_CACHE_DIR. The
+// stable launcher is a standalone file under ~/.claude/model-gateway, so it
+// carries its own copy of that resolution: on a migrated host it has to find
+// the newer install listed in the cache dir rather than the stale copy still
+// sitting in <config dir>/plugins.
+test('stable command launcher reads the registry in CLAUDE_CODE_PLUGIN_CACHE_DIR', (t) => {
+  const home = temporaryDirectory(t);
+  const cacheDirectory = path.join(home, 'claude-agent-plugins');
+  const staleInstall = path.join(home, 'model-gateway-0.1.9');
+  const currentInstall = path.join(home, 'model-gateway-0.2.0');
+  const result = path.join(home, 'result.json');
+  for (const install of [staleInstall, currentInstall]) {
+    fs.mkdirSync(path.join(install, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(install, 'bin', 'model-gateway.js'), [
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.MODEL_GATEWAY_TEST_RESULT, JSON.stringify([process.argv[1], ...process.argv.slice(2)]));",
+      'process.exit(Number(process.env.MODEL_GATEWAY_TEST_EXIT));',
+    ].join('\n'));
+  }
+  // The config-dir registry is the stale copy a migration leaves behind.
+  fs.mkdirSync(path.join(home, '.claude', 'plugins'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    plugins: { 'model-gateway@eigenwise-toolshed': [{ version: '0.1.9', installPath: staleInstall }] },
+  }));
+  fs.mkdirSync(cacheDirectory, { recursive: true });
+  fs.writeFileSync(path.join(cacheDirectory, 'installed_plugins.json'), JSON.stringify({
+    plugins: { 'model-gateway@eigenwise-toolshed': [{ version: '0.2.0', installPath: currentInstall }] },
+  }));
+  const launcher = writer.writeCommandLauncher({ home }).file;
+  const env = {
+    ...process.env,
+    MODEL_GATEWAY_CLAUDE_HOME: undefined,
+    CLAUDE_CODE_PLUGIN_CACHE_DIR: cacheDirectory,
+    CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+    MODEL_GATEWAY_TEST_RESULT: result,
+    MODEL_GATEWAY_TEST_EXIT: '13',
+  };
+  delete env.MODEL_GATEWAY_CLAUDE_HOME;
+
+  const invoked = spawnGatewayProcessSync(process.execPath, [launcher, 'doctor'], { encoding: 'utf8', env });
+
+  assert.equal(invoked.status, 13, invoked.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(result, 'utf8')), [path.join(currentInstall, 'bin', 'model-gateway.js'), 'doctor']);
+});

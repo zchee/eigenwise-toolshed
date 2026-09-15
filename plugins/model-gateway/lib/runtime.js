@@ -459,6 +459,82 @@ function canReplaceInstalledCliPath(currentCliPath, candidateCliPath) {
   return !versionIsOlder(candidateVersion, currentVersion);
 }
 
+const PLUGIN_NAME = 'model-gateway';
+
+// Claude Code keeps its plugin installs either under CLAUDE_CODE_PLUGIN_CACHE_DIR
+// or, when that is unset, under <config dir>/plugins. Both layouts hold
+// installed_plugins.json beside the same cache/<marketplace>/<plugin>/<version>
+// tree, so a host that moved the cache is a different directory, not a
+// different shape. Callers get every registry that exists rather than the first
+// one: during a cache-dir migration both files are present and either may be
+// the stale copy, and the entries themselves carry the install paths we need.
+function pluginRegistryDirectories(env = process.env) {
+  const directories = [];
+  if (env.CLAUDE_CODE_PLUGIN_CACHE_DIR) directories.push(path.resolve(env.CLAUDE_CODE_PLUGIN_CACHE_DIR));
+  const configDirectory = env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  const legacyDirectory = path.join(path.resolve(configDirectory), 'plugins');
+  if (!directories.includes(legacyDirectory)) directories.push(legacyDirectory);
+  return directories;
+}
+
+function installedPluginsRegistryPaths(env = process.env) {
+  return pluginRegistryDirectories(env).map((directory) => path.join(directory, 'installed_plugins.json'));
+}
+
+// A full plugin id (name@marketplace) matches that one key; a bare plugin name
+// matches the plugin installed from any marketplace, so a fork install counts.
+function readInstalledPluginEntries(pluginId, {
+  env = process.env,
+  readFile = fs.readFileSync,
+} = {}) {
+  const matches = pluginId.includes('@') ? (key) => key === pluginId : (key) => key.startsWith(`${pluginId}@`);
+  const entries = [];
+  for (const file of installedPluginsRegistryPaths(env)) {
+    let registry;
+    try { registry = JSON.parse(readFile(file, 'utf8')); } catch { continue; }
+    for (const [key, installs] of Object.entries(registry?.plugins || {})) {
+      if (!matches(key) || !Array.isArray(installs)) continue;
+      entries.push(...installs.filter(Boolean).map((install) => ({ ...install, registry: file })));
+    }
+  }
+  return entries;
+}
+
+// Registry versions are the install directory names Claude Code recorded, so they are ordinary
+// semantic versions; compare them numerically, newest first, and break a tie on the recorded
+// update time. This is the stable launcher's ordering, so the launcher and the SessionStart hook
+// always land on the same install.
+function newestRegisteredInstallFirst(left, right) {
+  const numbers = (value) => String(value == null ? '' : value).split(/[^0-9]+/).map(Number);
+  const a = numbers(left.version);
+  const b = numbers(right.version);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const difference = (b[index] || 0) - (a[index] || 0);
+    if (difference !== 0) return difference;
+  }
+  return String(right.lastUpdated || '').localeCompare(String(left.lastUpdated || ''));
+}
+
+// The CLI of the install Claude Code recorded in installed_plugins.json: the copy whose supervisor
+// owns the gateway port, which is not necessarily the copy a session loaded. A directory
+// marketplace loads a development checkout while the recorded install keeps serving, and the two
+// roots differ even when the code is identical. Returns null when no recorded install has a CLI on
+// disk: a --plugin-dir checkout, a registry Claude Code has not written yet, or an install
+// directory that was removed.
+function resolveRegisteredCliPath({
+  pluginId = PLUGIN_NAME,
+  env = process.env,
+  readEntries = readInstalledPluginEntries,
+  pathExists = fs.existsSync,
+} = {}) {
+  const installed = readEntries(pluginId, { env })
+    .filter((entry) => typeof entry?.installPath === 'string' && entry.installPath)
+    .map((entry) => ({ ...entry, cliPath: path.join(entry.installPath, 'bin', 'model-gateway.js') }))
+    .filter((entry) => pathExists(entry.cliPath))
+    .sort(newestRegisteredInstallFirst);
+  return installed.length ? installed[0].cliPath : null;
+}
+
 function resolveNewestInstalledCliPath({ cliPath = CLI_PATH, readDirectory = fs.readdirSync, pathExists = fs.existsSync } = {}) {
   const pluginRoot = path.dirname(path.dirname(cliPath));
   const pluginCacheRoot = path.dirname(pluginRoot);
@@ -507,6 +583,8 @@ module.exports = {
   canReplaceInstalledCliPath, codexClientModelId, codexContextWindow, codexContextWindowModelId,
   codexReadinessMessage,
   gatewayAdvertisedWindow, gatewayBackendModelId, gatewayClientModelId, gatewayDiscoveryModels,
+  installedPluginsRegistryPaths, pluginRegistryDirectories, readInstalledPluginEntries,
   readGatewayDiscoveryCache, resolveGatewayModelPolicy, resolveNewestInstalledCliPath, resolveStableCommandPath,
+  resolveRegisteredCliPath,
   sameGatewayDiscoveryModels, syncGatewayDiscoveryCache,
 };

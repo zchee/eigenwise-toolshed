@@ -33,7 +33,7 @@ Reload the plugin, then start the Model Gateway skill:
 
 The skill runs `setup`, which installs and starts the local gateway, checks your login, writes the current project's `.claude/settings.local.json`, and confirms the project wiring. If setup asks for login, complete the browser sign-in, then let Claude run `setup` again to finish the wiring and confirmation. The bundled `env --write-user` command enables machine-wide wiring, while `env --write-project` wires one project.
 
-For direct recovery, run `node ~/.claude/model-gateway/model-gateway.js <command>`. SessionStart recreates that launcher from Claude Code's installed-plugin registry, so it follows upgrades, uses an installed downgrade when newer copies are gone, and reports a missing install clearly.
+For direct recovery, run `node ~/.claude/model-gateway/model-gateway.js <command>`. SessionStart recreates that launcher from Claude Code's installed-plugin registry, so it follows upgrades, uses an installed downgrade when newer copies are gone, and reports a missing install clearly. The SessionStart startup check reads that same registry and runs the installed copy, so a development checkout loaded from a directory marketplace does not report the installed gateway that owns the port as a foreign install; a checkout the registry does not list still runs itself.
 
 After the project wiring is confirmed, fully restart the Claude Code process for that same project. A plugin reload alone does not reload the model picker or settings from the new process. Select a gateway model only after that restart.
 

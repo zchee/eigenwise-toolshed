@@ -7,7 +7,7 @@ const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
 const path = require('node:path');
-const { CLI_PATH, LOGS, PLUGIN_VERSION, PROXY_BIN, PROXY_PORT, PUBLIC_SHIM_PORT, resolveNewestInstalledCliPath, SHIM_PORT, STATE, WIN } = require('./runtime.js');
+const { CLI_PATH, LOGS, PLUGIN_VERSION, pluginRegistryDirectories, PROXY_BIN, PROXY_PORT, PUBLIC_SHIM_PORT, resolveNewestInstalledCliPath, SHIM_PORT, STATE, WIN } = require('./runtime.js');
 const { recordGatewayLifecycle } = require('./lifecycle-diagnostics.js');
 const { controlRequestHeaders } = require('./control-auth.js');
 const PROCESS_STOP_TIMEOUT_MS = 3000;
@@ -512,6 +512,16 @@ function gatewayInstallRootFromCommand(command) {
   const cliPath = match?.slice(1).find(Boolean);
   return cliPath ? path.resolve(path.join(cliPath, '..', '..')) : null;
 }
+// The directory that holds `cache/` for a recognized plugin install: either a
+// `plugins` directory under a Claude config dir, or the cache root the host
+// named in CLAUDE_CODE_PLUGIN_CACHE_DIR. The check stays anchored so an
+// unrelated path shaped like `X/cache/Y/model-gateway/1.2.3` is not mistaken
+// for a sibling install of this plugin.
+function isPluginCacheParent(directory) {
+  if (path.basename(directory).toLowerCase() === 'plugins') return true;
+  const normalizedDirectory = normalizedPath(directory);
+  return pluginRegistryDirectories().some((registryDirectory) => normalizedPath(registryDirectory) === normalizedDirectory);
+}
 function pluginCacheIdentity(installRoot) {
   if (!installRoot) return null;
   const physicalInstallRoot = resolvedPhysicalPath(installRoot);
@@ -521,7 +531,7 @@ function pluginCacheIdentity(installRoot) {
   const cacheRoot = path.dirname(marketplaceRoot);
   if (path.basename(pluginRoot).toLowerCase() !== 'model-gateway'
     || path.basename(cacheRoot).toLowerCase() !== 'cache'
-    || path.basename(path.dirname(cacheRoot)).toLowerCase() !== 'plugins') return null;
+    || !isPluginCacheParent(path.dirname(cacheRoot))) return null;
   return normalizedPath(pluginRoot);
 }
 function installBelongsToThisPlugin(installRoot, currentInstallRoot = gatewayInstallRoot()) {
@@ -1199,7 +1209,7 @@ function createProxyRecovery({
 }
 
 module.exports = {
-  commandIncludesFile, commandResultAsync, commandResultSync, createProbeChildRegistry, createProxyRecovery, fetchUrl, foreignPortOwner, foreignPortOwnerReason, gatewayInstallRoot, gatewayInstallRootFromCommand, installBelongsToThisPlugin, isConfirmedOrphan, isDescendantOfAsync, killPid, killPidAsync, listeningPidsFromNetstat, pidFile, pidRecordFile, pluginCacheIdentity, portListening, postJson,
+  commandIncludesFile, commandResultAsync, commandResultSync, createProbeChildRegistry, createProxyRecovery, fetchUrl, foreignPortOwner, foreignPortOwnerReason, gatewayInstallRoot, gatewayInstallRootFromCommand, installBelongsToThisPlugin, isConfirmedOrphan, isDescendantOfAsync, isPluginCacheParent, killPid, killPidAsync, listeningPidsFromNetstat, pidFile, pidRecordFile, pluginCacheIdentity, portListening, postJson,
   probeTimeoutMs, probeWorkerIdentity, processInfoAsync, processInfoSync, processIsOwnedByThisInstall, processIsOwnedByThisInstallAsync, processOwningPort: processOwningPortSync, processOwningPortAsync, processTableAsync, processTableSync, resolvePortOwner, unknownPortOwnerReason,
   proxyModelsAnswering, readPid, readPidRecord, recordedGatewayPid, recordedGatewayPids, reapGatewayOrphans, redirectRequest, removePid, restartWorkerWithDrain, shimHealthy, signalOrphanWorker, spawnDetached,
   spawnSupervisedProxy, stopAll, stopProcess, stopProcessAsync, stopRunningSupervisor, stopShimWithDrain, waitForPortRelease, waitForShimExit, writePidRecord, writePidRecordAsync,

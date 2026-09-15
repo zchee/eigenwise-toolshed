@@ -49,6 +49,7 @@ const grokBackend = require('./grok-backend.js');
 const {
   canReplaceInstalledCliPath, CLI_PATH, GATEWAY_MODELS_CACHE, MODEL_WINDOW_POLICY, resolveStableCommandPath,
   gatewayAdvertisedWindow, gatewayClientModelId, gatewayDiscoveryModels, readGatewayDiscoveryCache,
+  readInstalledPluginEntries,
   resolveGatewayModelPolicy, sameGatewayDiscoveryModels, SOCKET_PATH, resolveNewestInstalledCliPath,
   syncGatewayDiscoveryCache, CONTEXT_WINDOW_PATH, contextWindowCap, contextWindowCompactAt, readContextWindowSettings,
   writeContextWindowSettings,
@@ -301,15 +302,13 @@ configureRemoteControl({ args, flag, log, die, doctor, fetchShimHealth, requestS
 // project-local wiring are the standard configuration. We still report an
 // installed user copy for diagnosis, without treating either scope as broken.
 //
-// Returns 'user', 'project-only', or 'unknown' when installed_plugins.json is
-// absent (for example, a --plugin-dir development checkout).
-function installScope(home = os.homedir()) {
+// Returns 'user', 'project-only', or 'unknown' when no installed_plugins.json
+// lists this plugin (for example, a --plugin-dir development checkout). A home
+// argument confines the search to <home>/.claude/plugins.
+function installScope(home) {
   try {
-    const file = path.join(home, '.claude', 'plugins', 'installed_plugins.json');
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const entries = Object.entries(data.plugins || {})
-      .filter(([pluginId]) => pluginId.startsWith('model-gateway@'))
-      .flatMap(([, installs]) => installs);
+    const env = home ? { CLAUDE_CONFIG_DIR: path.join(home, '.claude') } : process.env;
+    const entries = readInstalledPluginEntries('model-gateway', { env });
     if (!entries.length) return 'unknown';
     return entries.some((entry) => entry.scope === 'user') ? 'user' : 'project-only';
   } catch { return 'unknown'; }

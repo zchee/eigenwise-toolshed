@@ -33,14 +33,34 @@ function modelGatewayInstalls(registry) {
     .flatMap(([, installs]) => installs);
 }
 
+// Claude Code writes installed_plugins.json into CLAUDE_CODE_PLUGIN_CACHE_DIR
+// when the host sets it, and into <config dir>/plugins otherwise. A migration
+// leaves both files on disk with either one stale, so read every registry we
+// can find and let the version comparison below pick the winner.
+// MODEL_GATEWAY_CLAUDE_HOME is an explicit whole-home override and replaces
+// that search when it is set.
+function installedPluginRegistries() {
+  const overriddenHome = process.env.MODEL_GATEWAY_CLAUDE_HOME;
+  if (overriddenHome) return [path.join(overriddenHome, 'plugins', 'installed_plugins.json')];
+  const directories = [];
+  if (process.env.CLAUDE_CODE_PLUGIN_CACHE_DIR) directories.push(path.resolve(process.env.CLAUDE_CODE_PLUGIN_CACHE_DIR));
+  const configDirectory = path.resolve(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
+  const legacyDirectory = path.join(configDirectory, 'plugins');
+  if (!directories.includes(legacyDirectory)) directories.push(legacyDirectory);
+  return directories.map((directory) => path.join(directory, 'installed_plugins.json'));
+}
+
 function currentModelGatewayCli() {
-  const claudeHome = process.env.MODEL_GATEWAY_CLAUDE_HOME || path.join(os.homedir(), '.claude');
   try {
-    const registry = JSON.parse(fs.readFileSync(path.join(claudeHome, 'plugins', 'installed_plugins.json'), 'utf8'));
-    const candidates = modelGatewayInstalls(registry)
-      .filter((install) => install?.installPath)
-      .map((install) => ({ ...install, script: path.join(install.installPath, 'bin', 'model-gateway.js') }))
-      .filter((install) => fs.existsSync(install.script));
+    const candidates = [];
+    for (const file of installedPluginRegistries()) {
+      let registry;
+      try { registry = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
+      candidates.push(...modelGatewayInstalls(registry)
+        .filter((install) => install?.installPath)
+        .map((install) => ({ ...install, script: path.join(install.installPath, 'bin', 'model-gateway.js') }))
+        .filter((install) => fs.existsSync(install.script)));
+    }
     candidates.sort((left, right) => compareVersions(right.version, left.version)
       || String(right.lastUpdated || '').localeCompare(String(left.lastUpdated || '')));
     return candidates[0]?.script;

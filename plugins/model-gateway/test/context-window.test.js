@@ -186,6 +186,7 @@ test('Codex discovery advertises client 1M aliases and forwards backend base ids
     { id: 'claude-gpt-5.6-luna[1m]', max_input_tokens: 272000 },
     { id: 'claude-gpt-6-astra[1m]', max_input_tokens: 272000 },
   ]);
+  assert.ok(models.data.some(({ id }) => id === 'claude-grok-4.6[1m]'));
   assert.ok(models.data.some(({ id }) => id === 'claude-grok-4.5[1m]'));
   const { resolveGatewayModelPolicy } = require(RUNTIME);
   assert.equal(models.data.every(({ id }) => (
@@ -209,6 +210,7 @@ test('window policy marks measured rows and advertises unmeasured Codex defaults
     assert.equal(policy.pickerAlias.endsWith('[1m]'), policy.backendWindow > 200000);
     assert.equal(policy.sentry, policy.backendWindow > 200000 ? 'synthetic-413' : 'none');
   }
+  assert.equal(MODEL_WINDOW_POLICY['grok-4.6'].pickerAlias, 'claude-grok-4.6[1m]');
   assert.equal(MODEL_WINDOW_POLICY['grok-4.5'].pickerAlias, 'claude-grok-4.5[1m]');
   assert.match(MODEL_WINDOW_POLICY.default.measurement, /^unmeasured/);
   assert.deepEqual(resolveGatewayModelPolicy('gpt-5.2'), {
@@ -1598,6 +1600,7 @@ test('doctor policy table includes gateway and native model rows', () => {
   const { modelWindowPolicyRows } = require(COMMANDS);
   const rows = modelWindowPolicyRows();
 
+  assert.equal(rows.some((row) => row.backendId === 'grok-4.6' && row.pickerId === 'claude-grok-4.6[1m]'), true);
   assert.equal(rows.some((row) => row.backendId === 'grok-4.5' && row.pickerId === 'claude-grok-4.5[1m]'), true);
   assert.equal(rows.some((row) => row.backendId === 'claude-haiku-4-5' && row.sentry === 'none'), true);
 

@@ -103,6 +103,15 @@ const MODEL_WINDOW_POLICY = Object.freeze({
     advertisedWindow: 920000,
     sentry: 'synthetic-413',
   }),
+  'grok-4.7': Object.freeze({
+    backend: 'grok',
+    backendId: 'grok-4.7',
+    backendWindow: 500000,
+    measurement: 'measured 2026-09-23 from Grok CLI models_cache.json (context_window 500000)',
+    pickerAlias: 'claude-grok-4.7[1m]',
+    advertisedWindow: 500000,
+    sentry: 'none',
+  }),
   'grok-4.6': Object.freeze({
     backend: 'grok',
     backendId: 'grok-4.6',
@@ -436,7 +445,7 @@ function parseInstalledCliVersion(cliPath) {
 
 function canReplaceInstalledCliPath(currentCliPath, candidateCliPath) {
   if (typeof currentCliPath !== 'string' || typeof candidateCliPath !== 'string'
-      || !path.isAbsolute(currentCliPath) || !path.isAbsolute(candidateCliPath)) return false;
+    || !path.isAbsolute(currentCliPath) || !path.isAbsolute(candidateCliPath)) return false;
   const current = path.resolve(currentCliPath);
   const candidate = path.resolve(candidateCliPath);
   let realCurrent;

@@ -32,8 +32,10 @@ function listen(server) {
 
 function request(port, method, pathname, body, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, method, path: pathname,
-      headers: { ...(body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {}), ...extraHeaders } }, (res) => {
+    const req = http.request({
+      host: '127.0.0.1', port, method, path: pathname,
+      headers: { ...(body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {}), ...extraHeaders }
+    }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
@@ -45,8 +47,10 @@ function request(port, method, pathname, body, extraHeaders = {}) {
 
 function requestStream(port, body) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/v1/messages',
-      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => {
+    const req = http.request({
+      host: '127.0.0.1', port, method: 'POST', path: '/v1/messages',
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }
+    }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
@@ -142,13 +146,15 @@ test('Codex discovery advertises client 1M aliases and forwards backend base ids
   const proxy = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/v1/models') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify({ data: [
-        { id: 'gpt-5.2' },
-        { id: 'gpt-5.6-sol' },
-        { id: 'gpt-5.6-terra' },
-        { id: 'gpt-5.6-luna' },
-        { id: 'gpt-6-astra' },
-      ] }));
+      return res.end(JSON.stringify({
+        data: [
+          { id: 'gpt-5.2' },
+          { id: 'gpt-5.6-sol' },
+          { id: 'gpt-5.6-terra' },
+          { id: 'gpt-5.6-luna' },
+          { id: 'gpt-6-astra' },
+        ]
+      }));
     }
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
@@ -186,6 +192,7 @@ test('Codex discovery advertises client 1M aliases and forwards backend base ids
     { id: 'claude-gpt-5.6-luna[1m]', max_input_tokens: 272000 },
     { id: 'claude-gpt-6-astra[1m]', max_input_tokens: 272000 },
   ]);
+  assert.ok(models.data.some(({ id }) => id === 'claude-grok-4.7[1m]'));
   assert.ok(models.data.some(({ id }) => id === 'claude-grok-4.6[1m]'));
   assert.ok(models.data.some(({ id }) => id === 'claude-grok-4.5[1m]'));
   const { resolveGatewayModelPolicy } = require(RUNTIME);
@@ -210,6 +217,7 @@ test('window policy marks measured rows and advertises unmeasured Codex defaults
     assert.equal(policy.pickerAlias.endsWith('[1m]'), policy.backendWindow > 200000);
     assert.equal(policy.sentry, policy.backendWindow > 200000 ? 'synthetic-413' : 'none');
   }
+  assert.equal(MODEL_WINDOW_POLICY['grok-4.7'].pickerAlias, 'claude-grok-4.7[1m]');
   assert.equal(MODEL_WINDOW_POLICY['grok-4.6'].pickerAlias, 'claude-grok-4.6[1m]');
   assert.equal(MODEL_WINDOW_POLICY['grok-4.5'].pickerAlias, 'claude-grok-4.5[1m]');
   assert.match(MODEL_WINDOW_POLICY.default.measurement, /^unmeasured/);
@@ -1600,6 +1608,7 @@ test('doctor policy table includes gateway and native model rows', () => {
   const { modelWindowPolicyRows } = require(COMMANDS);
   const rows = modelWindowPolicyRows();
 
+  assert.equal(rows.some((row) => row.backendId === 'grok-4.7' && row.pickerId === 'claude-grok-4.7[1m]'), true);
   assert.equal(rows.some((row) => row.backendId === 'grok-4.6' && row.pickerId === 'claude-grok-4.6[1m]'), true);
   assert.equal(rows.some((row) => row.backendId === 'grok-4.5' && row.pickerId === 'claude-grok-4.5[1m]'), true);
   assert.equal(rows.some((row) => row.backendId === 'claude-haiku-4-5' && row.sentry === 'none'), true);

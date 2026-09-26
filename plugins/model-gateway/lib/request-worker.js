@@ -224,6 +224,8 @@ const DEFAULT_MODELS = [
   'gpt-6.1-sol', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra',
 ];
 const DEFAULT_GROK_MODELS = grokBackend.GROK_MODELS;
+const LISTING_RETRY_INITIAL_MS = 1000;
+const LISTING_RETRY_MAX_MS = 30000;
 
 function isGrokBackendModel(model) {
   return resolveGatewayModelPolicy(model.id)?.transport === 'grok';
@@ -1314,12 +1316,30 @@ function runWorker() {
     }
   }
 
+  // The supervisor starts the worker and the proxy together, so the first read usually finds no
+  // proxy yet. Without a retry the shim served the built-in Codex fallback until a /v1/models
+  // request arrived after the 60-second cache age, and a wired worker wrote that short list into
+  // Claude Code's picker cache.
+  let listingRetryTimer = null;
+  let listingRetryDelayMs = LISTING_RETRY_INITIAL_MS;
+  function scheduleListingRetry() {
+    if (listingRetryTimer) return;
+    listingRetryTimer = setTimeout(() => {
+      listingRetryTimer = null;
+      refreshModels();
+    }, listingRetryDelayMs);
+    listingRetryTimer.unref();
+    listingRetryDelayMs = Math.min(listingRetryDelayMs * 2, LISTING_RETRY_MAX_MS);
+  }
+
   async function refreshModels({ logSentryPolicies = false } = {}) {
     let routes = [];
     try {
       const r = await fetchUrl(`http://127.0.0.1:${PROXY_PORT}/v1/models`, { timeout: 2500 });
       if (r.status === 200) routes = parseProxyModelListing(JSON.parse(r.body.toString()).data);
     } catch { /* proxy down or no such route */ }
+    if (routes.length) listingRetryDelayMs = LISTING_RETRY_INITIAL_MS;
+    else scheduleListingRetry();
     // A refresh that cannot read the listing keeps the last one: dropping it would hand every
     // non-Codex picker id to api.anthropic.com until the proxy answers again. Only a list the
     // proxy answered is a real catalog; models.json and the built-in list stand in while the

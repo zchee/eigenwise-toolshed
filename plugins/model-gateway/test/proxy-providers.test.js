@@ -313,3 +313,43 @@ test('the Sidequest catalog lists every proxy provider under its own slug and re
   }
   assert.equal(catalog.providers.codex.state, 'binary-missing');
 });
+
+test('a shim that starts before the proxy lists the proxy models without waiting for a request', async (t) => {
+  // Every listing read fails for a while, the way a proxy that is still starting does. A time
+  // window rather than a read count, because the supervisor's own health probes read it too.
+  const unavailableUntil = Date.now() + 1500;
+  let listingReads = 0;
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      listingReads += 1;
+      if (Date.now() < unavailableUntil) {
+        res.writeHead(503);
+        return res.end();
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ object: 'list', data: PROXY_LISTING, has_more: false }));
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const proxyPort = await listen(server);
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const anthropic = await anthropicUpstream(t);
+  const environment = gatewayTestEnvironment(t, {
+    CODEX_GATEWAY_PROXY_PORT: String(proxyPort),
+    CODEX_GATEWAY_REQUEST_LOG: '0',
+    CODEX_GATEWAY_ANTHROPIC_UPSTREAM: anthropic.url,
+  });
+  const { port } = await startGateway(t, 'serve-shim', environment);
+
+  // One refresh-triggering read is allowed; the retries themselves must bring the listing in,
+  // well inside the 60-second cache age a request would otherwise have to wait out.
+  const deadline = Date.now() + 10000;
+  let ids = [];
+  while (Date.now() < deadline) {
+    ids = JSON.parse((await request(port, 'GET', '/v1/models')).body).data.map((model) => model.id);
+    if (ids.includes('claude-kimi-k3')) break;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  assert.ok(ids.includes('claude-kimi-k3'), `shim still served the fallback after ${listingReads} listing reads: ${ids.join(', ')}`);
+});

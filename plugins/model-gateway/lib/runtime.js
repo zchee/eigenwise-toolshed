@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const grokBackend = require('./grok-backend.js');
 const { writeFileAtomically } = require('./atomic-file.js');
+const { CODEX_FAMILY_RE, proxyModelProvider } = require('./proxy-models.js');
 
 const WIN = process.platform === 'win32';
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
@@ -21,7 +22,6 @@ const SHIM_PORT = Number(process.env.CODEX_GATEWAY_WORKER_PORT || PUBLIC_SHIM_PO
 const PROXY_PORT = Number(process.env.CODEX_GATEWAY_PROXY_PORT || 18765);
 const PREFIX = 'claude-';
 const GROK_PREFIX = 'claude-grok-';
-const CODEX_FAMILY_RE = /^gpt-/;
 const LEGACY_CODEX_PREFIX = 'claude-codex-';
 const DISPATCH_MODEL_ID = 'claude-codex-auto';
 const GROK_ENDPOINT = process.env.CODEX_GATEWAY_GROK_ENDPOINT || grokBackend.GROK_ENDPOINT;
@@ -277,21 +277,48 @@ function codexContextWindowModelId(id) {
   return baseId || 'default';
 }
 
+// claude-code-proxy providers other than Codex publish no context window, and the table above
+// admits only measured rows. Advertising Claude Code's own unknown-model window keeps the client
+// compacting well before a smaller backend limit; a real overflow still comes back as a 413.
+function proxyProviderPolicy(provider) {
+  return {
+    backend: provider,
+    transport: 'proxy',
+    backendId: null,
+    backendWindow: null,
+    measurement: `unmeasured default for claude-code-proxy ${provider} rows absent from this table`,
+    pickerAliasTemplate: 'claude-{backendId}[1m]',
+    advertisedWindow: CODEX_UNKNOWN_MODEL_WINDOW,
+    sentry: 'none',
+  };
+}
+
+// transport says who serves a request: 'proxy' (claude-code-proxy, Codex included), 'grok' (this
+// plugin's Grok backend), or 'anthropic' (byte-identical passthrough). A Grok row the table does
+// not measure is one only the proxy's Grok provider serves, so its policy names 'proxy' itself.
+function policyTransport(policy) {
+  if (policy.transport) return policy.transport;
+  return policy.backend === 'anthropic' || policy.backend === 'grok' ? policy.backend : 'proxy';
+}
+
 function resolveGatewayModelPolicy(id) {
   const backendId = gatewayBackendModelId(id);
   const policyId = backendId.startsWith('gpt-') ? backendId.replace(/-fast$/, '') : backendId;
-  const policy = MODEL_WINDOW_POLICY[policyId]
+  const provider = proxyModelProvider(backendId);
+  const policy = (policyId !== 'default' && Object.hasOwn(MODEL_WINDOW_POLICY, policyId) ? MODEL_WINDOW_POLICY[policyId] : null)
     || (backendId.startsWith('gpt-') ? MODEL_WINDOW_POLICY.default : null)
+    || (provider ? proxyProviderPolicy(provider) : null)
     || (typeof id === 'string' && id.startsWith(PREFIX) && !id.startsWith(LEGACY_CODEX_PREFIX)
       ? MODEL_WINDOW_POLICY.anthropic
       : null);
   if (!policy) return null;
+  const transport = policyTransport(policy);
   const pickerAlias = policy.backendId === backendId && policy.pickerAlias
     ? policy.pickerAlias
     : policy.pickerAliasTemplate
       ? policy.pickerAliasTemplate.replace('{backendId}', backendId)
       : `${PREFIX}${backendId}[1m]`;
-  return { ...policy, backendId, pickerAlias };
+  return { ...policy, backendId, pickerAlias, transport };
 }
 
 function gatewayAdvertisedWindow(id) {

@@ -47,6 +47,9 @@ const { fetchLatestRelease } = require('./github-release.js');
 const { createGatewayUsageEmitter, recordRequestBodyHighWater } = require('./usage-observability.js');
 const grokBackend = require('./grok-backend.js');
 const {
+  parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes, setProxyModelRoutes,
+} = require('./proxy-models.js');
+const {
   canReplaceInstalledCliPath, CLI_PATH, GATEWAY_MODELS_CACHE, MODEL_WINDOW_POLICY, resolveStableCommandPath,
   gatewayAdvertisedWindow, gatewayClientModelId, gatewayDiscoveryModels, readGatewayDiscoveryCache,
   readInstalledPluginEntries,
@@ -85,12 +88,12 @@ const QUIET_STARTUP_WAIT_MS = 12000;
 // anthropic, so an unprefixed id vanishes from /model.
 //
 // Real Anthropic ids share that prefix, so PREFIX alone can NEVER decide a
-// route — matching on it would send claude.ai traffic to the Codex proxy. The
-// backend family segment decides: `gpt-*` is Codex, `grok-*` is Grok, anything
-// else passes through untouched.
+// route — matching on it would send claude.ai traffic to the proxy. The rest
+// of the id decides: `gpt-*` is Codex, an id the proxy's /v1/models attributes
+// to a provider goes to that provider, a measured `grok-*` row goes to this
+// plugin's Grok backend, and anything else passes through untouched.
 const PREFIX = 'claude-';
 const GROK_PREFIX = 'claude-grok-';
-const CODEX_FAMILY_RE = /^gpt-/;
 // Pre-3.x advertised the backend name too (`claude-codex-gpt-5.6-sol`). Claude
 // Code persists the selected model per project, so those ids outlive the
 // upgrade in every already-wired project; keep resolving them.
@@ -129,7 +132,7 @@ const {
 } = require('./runtime.js');
 const {
   codexBaseFromId, detectedPinDefaults, effectivePins, envBlockFor, gatewayEnvBlock, isGatewayModelId,
-  claudeVersion, isValidPin, ourBaseUrls, ownedPinValues, realClaudeRefusedUnderTest, pinProvenance, readPinOverrides, refreshDetectedPins, refreshCatalogPins, comparePinVersions, stalePinUpdates,
+  claudeVersion, isValidPin, ourBaseUrls, ownedPinValues, realClaudeRefusedUnderTest, pinProvenance, proxyRouteFromId, readPinOverrides, refreshDetectedPins, refreshCatalogPins, comparePinVersions, stalePinUpdates,
   writePinOverrides,
 } = require('./pins.js');
 
@@ -1253,7 +1256,8 @@ function configuredAutoCompactWindow() {
 }
 
 function windowValue(value) {
-  return Number.isFinite(value) ? String(value) : 'upstream-managed';
+  if (Number.isFinite(value)) return String(value);
+  return typeof value === 'string' ? value : 'upstream-managed';
 }
 
 function evidenceDate(measurement) {
@@ -1279,7 +1283,7 @@ function modelWindowPolicyRow(id, pickerId = gatewayClientModelId(id)) {
     backend: policy.backend,
     backendId: policy.backend === 'anthropic' ? id.replace(/\[1m\]$/, '') : policy.backendId,
     pickerId,
-    backendWindow: policy.backendWindow,
+    backendWindow: policy.backendWindow ?? (policy.backend === 'anthropic' ? null : 'unmeasured'),
     advertisedWindow: gatewayAdvertisedWindow(id),
     clientWindow,
     clientCompactPoint: 'unverified (native engine headroom)',
@@ -1293,7 +1297,7 @@ function policyGatewayModelIds(liveIds = []) {
   if (liveIds.length) {
     return [...new Set(liveIds.filter((id) => {
       const policy = resolveGatewayModelPolicy(id);
-      return policy?.backend === 'codex' || policy?.backend === 'grok';
+      return policy && policy.backend !== 'anthropic';
     }))];
   }
   return Object.values(MODEL_WINDOW_POLICY)
@@ -1344,6 +1348,7 @@ function reportModelWindowPolicy(liveIds = []) {
 }
 
 async function reportLiveShimModelPolicy() {
+  await loadProxyModelRoutes();
   let liveIds;
   try {
     liveIds = (await fetchShimModels()).map((model) => model.id);
@@ -1395,6 +1400,16 @@ async function doctor({ readiness: suppliedReadiness = null } = {}) {
     log(`grok auth: present (${grokBackend.readGrokVersion()})`);
   } catch (error) {
     log(`grok auth: ${error.message}`);
+  }
+  if (readiness.checks.proxyBinary && await loadProxyModelRoutes()) {
+    const providers = [...new Set(proxyModelRoutes().map((route) => route.provider))].filter((provider) => provider !== 'codex');
+    for (const provider of providers) {
+      const state = proxyProviderAuthState(provider);
+      const described = state === 'ready' ? (provider === 'opencode' ? 'API key present' : 'authenticated')
+        : state === 'auth-missing' ? `MISSING (${PROXY_PROVIDER_READINESS_REASONS[state](provider, providerLabel(provider))})`
+          : 'status unavailable';
+      log(`proxy ${provider} auth: ${described}`);
+    }
   }
   const status = await statusReport({ readiness });
   const servingVersion = readiness.checks.servingVersion;
@@ -1507,6 +1522,7 @@ async function doctor({ readiness: suppliedReadiness = null } = {}) {
 // end. See SQ-202.
 function displayName(id, backend = 'codex') {
   if (backend === 'grok') return id.replace(/^grok-/, 'Grok ').replace(/-/g, ' ');
+  if (backend !== 'codex') return proxyModelDisplayName(id, backend);
   return id.replace(/^gpt-/, 'GPT-').replace(/\[1m\]$/, '') + ' (Codex)';
 }
 
@@ -1591,9 +1607,12 @@ function labelFor(base) {
 }
 
 function modelCatalogDetails(id) {
-  const codexBase = codexBaseFromId(id);
-  if (codexBase && codexBase !== 'auto') {
-    return { provider: 'codex', base: codexBase, label: labelFor(codexBase) };
+  const route = proxyRouteFromId(id);
+  if (route?.provider === 'codex' && route.base !== 'auto') {
+    return { provider: 'codex', base: route.base, label: labelFor(route.base) };
+  }
+  if (route && route.provider !== 'codex') {
+    return { provider: route.provider, base: route.base, label: displayName(route.base, route.provider) };
   }
   if (typeof id === 'string' && id.startsWith(GROK_PREFIX)) {
     const base = id.slice(PREFIX.length).replace(/\[1m\]$/, '');
@@ -1628,10 +1647,63 @@ function getGrokReadiness({ readAuth = grokBackend.readGrokAuth } = {}) {
   }
 }
 
+// Mirrors claude-code-proxy's paths::resolve_config_dir, where it reads config.json.
+function proxyConfigDirectory({ env = process.env, platform = process.platform, home = os.homedir() } = {}) {
+  if (env.CCP_CONFIG_DIR) return env.CCP_CONFIG_DIR;
+  if (platform === 'win32') return path.join(env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'claude-code-proxy');
+  if (platform === 'darwin') return path.join(home, '.config', 'claude-code-proxy');
+  return path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), 'claude-code-proxy');
+}
+
+// `claude-code-proxy <provider> auth status` exits 0 when signed in and 1 when not. OpenCode Go
+// has no auth subcommand: the proxy reads an API key from its environment or config.json, so only
+// its presence can be checked, and only in this process's environment.
+function proxyProviderAuthState(provider, { run = spawnSync, env = process.env, configDirectory = proxyConfigDirectory() } = {}) {
+  if (provider === 'opencode') {
+    if (env.CCP_OPENCODE_API_KEY || env.OPENCODE_API_KEY) return 'ready';
+    const apiKey = readJsonFile(path.join(configDirectory, 'config.json'))?.opencode?.apiKey;
+    return typeof apiKey === 'string' && apiKey ? 'ready' : 'auth-missing';
+  }
+  const result = run(PROXY_BIN, [provider, 'auth', 'status'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+  if (result.status === 0) return 'ready';
+  return result.status === 1 ? 'auth-missing' : 'auth-unknown';
+}
+
+const PROXY_PROVIDER_READINESS_REASONS = {
+  'binary-missing': () => `claude-code-proxy is missing. Run \`node "${resolveStableCommandPath()}" setup\`.`,
+  'proxy-down': () => 'claude-code-proxy is not answering on /v1/models.',
+  'shim-down': () => 'the model-gateway shim is down.',
+  'serving-version-mismatch': () => 'model-gateway is serving a stale shim version.',
+  'auth-missing': (provider, label) => (provider === 'opencode'
+    ? `OpenCode Go needs an API key: set CCP_OPENCODE_API_KEY or OPENCODE_API_KEY where the gateway starts, or opencode.apiKey in ${path.join(proxyConfigDirectory(), 'config.json')}.`
+    : `claude-code-proxy has no ${label} sign-in. Run \`"${PROXY_BIN}" ${provider} auth login\`.`),
+  'auth-unknown': (provider, label) => `claude-code-proxy could not report ${label} sign-in status.`,
+};
+
+// Codex readiness already probed the binary, /v1/models, the shim, and its version, which every
+// proxy provider shares; only the provider's own sign-in is checked again here.
+function getProxyProviderReadiness(provider, codexReadiness, { authState = proxyProviderAuthState } = {}) {
+  const checks = codexReadiness?.checks || {};
+  const state = !checks.proxyBinary ? 'binary-missing'
+    : !checks.proxyModels ? 'proxy-down'
+      : !checks.shimRunning ? 'shim-down'
+        : !checks.servingVersionMatches ? 'serving-version-mismatch'
+          : authState(provider);
+  const label = providerLabel(provider);
+  return {
+    ready: state === 'ready',
+    state,
+    message: state === 'ready'
+      ? `${label} readiness confirms local binary, /v1/models, ${provider === 'opencode' ? 'API key presence' : 'authentication'}, shim, and serving-version checks. It does not prove a streaming request will succeed.`
+      : PROXY_PROVIDER_READINESS_REASONS[state](provider, label),
+  };
+}
+
 function providerCatalogReadiness(provider, readiness) {
   const source = readiness?.[provider] ?? (provider === 'codex' ? readiness : null);
   if (source) return providerReadiness(source);
   if (provider === 'grok') return getGrokReadiness();
+  if (readiness?.checks) return providerReadiness(getProxyProviderReadiness(provider, readiness));
   return unavailableProviderReadiness(provider);
 }
 
@@ -1775,7 +1847,22 @@ async function reportGatewayDiscoveryCache() {
   }
 }
 
+// The CLI runs outside the worker, so it reads the proxy's listing itself before resolving any
+// non-Codex id. While the proxy cannot answer only Codex ids resolve, which makes a catalog write
+// a subset write that keeps the stored non-Codex rows (see mergeSubsetCatalog).
+async function loadProxyModelRoutes() {
+  try {
+    const response = await fetchUrl(`http://127.0.0.1:${PROXY_PORT}/v1/models`, { timeout: 3000 });
+    if (response.status !== 200) return false;
+    const routes = parseProxyModelListing(JSON.parse(response.body.toString()).data);
+    if (!routes.length) return false;
+    setProxyModelRoutes(routes);
+    return true;
+  } catch { return false; }
+}
+
 async function writeCatalog() {
+  await loadProxyModelRoutes();
   const shimModels = await fetchShimModels();
   writeGatewayDiscoveryCache(shimModels, (await fetchShimHealth())?.catalog);
   const ids = shimModels.map((model) => model.id).filter((id) => modelCatalogDetails(id) != null);
@@ -2848,6 +2935,9 @@ module.exports = {
   getCodexReadiness,
   catalogReadiness,
   getGrokReadiness,
+  getProxyProviderReadiness,
+  proxyConfigDirectory,
+  proxyProviderAuthState,
   setUpstreamBlocked,
   clearUpstreamBlocked,
   readUpstreamUnavailable,

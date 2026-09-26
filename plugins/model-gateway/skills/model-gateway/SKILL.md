@@ -1,20 +1,26 @@
 ---
 name: model-gateway
 description: >-
-  Set up, update, or diagnose the local ChatGPT/Codex gateway for Claude Code's /model picker. Use
-  for gateway setup, login, model visibility, routing, or failures.
+  Set up, update, or diagnose the local gateway that puts ChatGPT/Codex, Grok, Kimi, Cursor, and
+  OpenCode Go models in Claude Code's /model picker. Use for gateway setup, login, model visibility,
+  routing, or failures.
 ---
 
 # model-gateway
 
-Two local processes give Claude Code native access to the user's ChatGPT subscription models:
-`claude-code-proxy` (does OpenAI OAuth and translates Anthropic Messages API to the Codex
-backend) and a shim router this plugin owns. `ANTHROPIC_BASE_URL` points at the shim: requests
-for `claude-gpt-*` models are un-prefixed and go to the proxy, everything else passes through
-to api.anthropic.com with the user's normal claude.ai login. The shim's `/v1/models` advertises
-Codex models with a `claude-` prefix because Claude Code's model discovery drops ids that don't
-start with `claude`/`anthropic`. That prefix is shared with the real Anthropic ids, so the route
-is decided by the backend family segment (`claude-gpt-*`, `claude-grok-*`), never by the prefix.
+Two local processes give Claude Code native access to the user's subscription models:
+`claude-code-proxy` (signs in to each provider and translates the Anthropic Messages API for its
+providers: codex, kimi, cursor, grok, and opencode) and a shim router this plugin owns.
+`ANTHROPIC_BASE_URL` points at the shim. The shim's `/v1/models` advertises every model the
+proxy's own `/v1/models` lists, as `claude-<proxy id>` (`claude-gpt-6-sol[1m]`, `claude-kimi-k3`,
+`claude-glm-5.3`, `claude-opencode-go/kimi-k2.6`, `claude-cursor-agent`), because Claude Code's
+model discovery drops ids that don't start with `claude`/`anthropic`. That prefix is shared with
+the real Anthropic ids, so the prefix never decides a route. The rest of the id does: `gpt-*` is
+Codex, an id the proxy's listing attributes to a provider goes un-prefixed to the proxy, a
+measured `grok-*` row (4.5, 4.6, 4.7) goes to this plugin's own Grok backend, and everything else
+passes through to api.anthropic.com with the user's normal claude.ai login. The proxy's
+Claude-style aliases (`haiku`, `sonnet`, `opus`, `fable`, `claude-*`) are never advertised or
+routed to it: behind the gateway those names are real Claude models.
 
 All commands: `node ~/.claude/model-gateway/model-gateway.js <command>`. SessionStart recreates this stable launcher from Claude Code's installed-plugin registry, so it follows upgrades and falls back to an installed downgrade; it reports a missing install directly.
 
@@ -120,10 +126,12 @@ SessionStart (`ensure --quiet`) and updates compare cached same-family versions 
 
 ## Selecting models
 
-- `/model` picker: rows like "GPT-6.1-sol (Codex)" and "Grok 4.5".
-- Typed: `/model claude-gpt-6.1-sol[1m]` or `/model claude-grok-4.5[1m]`. The picker and Sidequest catalog emit those exact ids. The suffix is stripped before routing to Codex or Grok.
+- `/model` picker: rows like "GPT-6.1-sol (Codex)", "Grok 4.5", "kimi-k3 (Kimi)", "glm-5.3 (OpenCode)", and "cursor-agent (Cursor)".
+- Typed: `/model claude-gpt-6.1-sol[1m]`, `/model claude-grok-4.5[1m]`, or `/model claude-kimi-k3`. The picker and Sidequest catalog emit those exact ids. The suffix and `claude-` prefix are stripped before routing to the proxy or Grok.
 - **Fable row behind the gateway**: with a custom base URL, Claude Code (inspected 2.1.322) lists the rows Anthropic's bootstrap sends, cached in `~/.claude.json` `additionalModelOptionsCache`, instead of its own Fable row, and that row can still be an older Fable (`claude-fable-5-1[1m]` labelled "Fable"). The bootstrap goes to api.anthropic.com directly, so the gateway cannot change it. Two supported levers fix the picker with no user action after update and restart: the wiring writes `ANTHROPIC_CUSTOM_MODEL_OPTION` (+`_NAME` "Fable", `_DESCRIPTION`) set to the effective Fable pin (newest catalog Fable, else the CLI's detected Fable), and the shim advertises any cached server row older than its family's pin under the same id as "<name> (previous)", which replaces the server row. Result: one "Fable" row on the current model, an honestly labelled previous row, and all Codex/Grok rows. Registered projects holding the Fable pin get the option at the next `ensure`; a user's own `ANTHROPIC_CUSTOM_MODEL_OPTION` value is never rewritten or removed. `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` would restore Claude Code's own rows but switches gateway discovery off, so it is not used.
 - **/model check**: `doctor` compares the first row named Fable, Opus and Sonnet behind the gateway with Claude Code's own rows (stream-json initialize, hooks disabled, no model request) and fails when one runs an older model or no Codex/Grok row is listed. `ensure` runs the same check once per `claude --version`, records it in `~/.claude/model-gateway/picker-guard.json`, and repeats a recorded failure as a SessionStart notice. A "(previous)" row is reported as an upstream note, not a failure.
+- Kimi, Cursor, OpenCode Go, and proxy-only Grok rows (`grok-composer-2.5-fast`) have no measured window, so they are advertised at Claude Code's 200k unknown-model window with no `[1m]` alias and no synthetic 413 sentry. A backend context-length error is still normalized to a 413 `request_too_large`, so Claude Code compacts. The Codex-only parts stay Codex-only: the sentry, OpenAI rejection blocking, the ChatGPT sign-in rewrite, the empty-completion answer, and tool-schema adaptation. Plan-mode tools are hidden from every non-Claude model.
+- Sign-in for those providers belongs to the proxy, not to `login`: `"~/.claude/model-gateway/bin/claude-code-proxy" <kimi|cursor|grok> auth login`. OpenCode Go takes an API key from `CCP_OPENCODE_API_KEY` or `OPENCODE_API_KEY` where the gateway starts, or `opencode.apiKey` in the proxy's `config.json`. `doctor` prints `proxy <provider> auth:` for each listed provider, and the Sidequest catalog carries a readiness entry per provider built from the same checks. Grok rows in the catalog report the Grok CLI sign-in this plugin's backend uses, even for the proxy-only Grok row.
 - `lib/runtime.js`'s exported `MODEL_WINDOW_POLICY` is the sole authority for gateway backend windows, picker aliases, advertised windows, and sentry mode. GPT-6.1 Sol, GPT-5.6 Sol, Terra, Luna, and GPT-6 Astra are measured rows. GPT-6.1 Sol is the default Codex model; GPT-6 Astra is reserved for frontier or high-stakes tickets. GPT ids absent from the table are deliberately advertised through its explicitly unmeasured 920k default, rather than silently inheriting a window. Grok 4.5 is a measured 500k row with a `[1m]` picker alias and the shared synthetic-413 sentry.
 - Codex GPT-5.6 through the ChatGPT Codex product (the subscription login this gateway routes to, not the pay-per-token API) accepted 920,012 input tokens and refused 935,012 on 2026-09-05 through claude-code-proxy 0.1.35 (upstream 55bf0b58). Every `synthetic-413` policy row keeps its backend-window-minus-40000 ceiling. With no saved `compactAt`, the lowest legacy environment trigger or cap-minus-85000 wins. With `compactAt.codex` or `compactAt.grok` saved, the explicit maximum replaces those legacy candidates, is clamped to the cap, and ignores `CODEX_GATEWAY_COMPACT_TRIGGER` without mutating it. Claude Code 2.1.261 ignores a settings-file `CLAUDE_CODE_MAX_CONTEXT_TOKENS` value for its own unrecognized-model resolver, so rows above 200k use their policy's recognized `[1m]` alias. That alias gives Claude Code a 1M client window, the closest available setting to the verified 920k backend window; it does not promise a 1M backend input limit. A lower explicit `autoCompactWindow` still wins. Use `/context` to inspect the selected model and effective cap.
 - **Context window and cost**: `context-window` saves backend windows in `~/.claude/model-gateway/context-window.json` (`--claude <tokens|full> --codex <tokens|full> --grok <tokens|full>`). Defaults stay Claude `full`, Codex `272000`, Grok `full`; existing installs are never auto-migrated. `/v1/models` advertises the cap and keeps `[1m]` ids. With no explicit maximum, the gateway's legacy cap policy subtracts 85000, so Codex still compacts past 187000.
@@ -154,7 +162,7 @@ SessionStart (`ensure --quiet`) and updates compare cached same-family versions 
 - Caution: loading a huge reference skill (e.g. `claude-api`, ~800k chars) in a single turn can
   spike Codex context past the point proactive compaction can recover from. Prefer pulling large
   references incrementally on Codex models.
-- The advertised catalog comes from the proxy's /v1/models; `models.json` and the built-in list only stand in while the proxy is unreachable. A `models.json` file cannot add a backend that the claude-code-proxy allowlist does not support; update the proxy through `setup` instead.
+- The proxy's `/v1/models` is the catalog, so a model a newer proxy adds appears once `setup` updates the proxy: the shim re-reads the listing on a `/v1/models` request when its copy is more than a minute old, and the picker shows new rows after a full Claude Code restart. Only when that listing cannot be read does the shim fall back to `~/.claude/model-gateway/models.json`, which accepts only Codex `gpt-*` ids, and then to a built-in Codex list.
 - **Claude Desktop cannot use Codex/Grok models in this version**: Desktop has its own native Gateway
   configuration, separate from Claude Code CLI settings, and can point at this shim's endpoint. But
   installed Desktop 1.49585.0 validates every Gateway model ID client-side and rejects any
@@ -168,7 +176,7 @@ SessionStart (`ensure --quiet`) and updates compare cached same-family versions 
   Code CLI is the verified path. VS Code success has been reported by users but is not independently
   verified here. This is version-specific and can be revisited if a future Desktop release removes
   the model-family filter.
-- **RC-compat and missing Codex rows**: On inspected Claude Code 2.1.267, RC-compatibility points `ANTHROPIC_BASE_URL` at `api.anthropic.com`, which disables gateway model discovery. The rows disappear and cache refresh cannot restore them. Claude Code can accept and persist `/model claude-gpt-5.6-terra[1m]`, but that client-side action does not prove a later request reaches the gateway. The current cleaner preserves canonical `[1m]` ids; do not present it as a fix for a reported request error. RC-compatibility makes Claude Code treat the gateway as first-party and can enable experimental message threading. The shim refuses Codex/Grok thread continuations locally with HTTP 400 because those backends have no conversation state. Nothing is forwarded or rerouted. A recognizing client drops the threading beta and resends the full message history. This is version- and experiment-limited, so do not promise one refusal per session. Normal gateway mode is the verified inference path. The reported 2.1.259 client and inspected 2.1.267 client have no verified end-to-end RC result: inspected session creation uses HTTPS while compatibility transport is HTTP. A detected hosts entry or bound listener proves local HTTP transport only. Sidequest dispatch is unaffected because it resolves its explicit route marker and never uses picker discovery.
+- **RC-compat and missing Codex rows**: On inspected Claude Code 2.1.267, RC-compatibility points `ANTHROPIC_BASE_URL` at `api.anthropic.com`, which disables gateway model discovery. The rows disappear and cache refresh cannot restore them. Claude Code can accept and persist `/model claude-gpt-5.6-terra[1m]`, but that client-side action does not prove a later request reaches the gateway. The current cleaner preserves canonical `[1m]` ids; do not present it as a fix for a reported request error. RC-compatibility makes Claude Code treat the gateway as first-party and can enable experimental message threading. The shim refuses thread continuations for every gateway model (proxy and Grok backends alike) locally with HTTP 400 because those backends have no conversation state. Nothing is forwarded or rerouted. A recognizing client drops the threading beta and resends the full message history. This is version- and experiment-limited, so do not promise one refusal per session. Normal gateway mode is the verified inference path. The reported 2.1.259 client and inspected 2.1.267 client have no verified end-to-end RC result: inspected session creation uses HTTPS while compatibility transport is HTTP. A detected hosts entry or bound listener proves local HTTP transport only. Sidequest dispatch is unaffected because it resolves its explicit route marker and never uses picker discovery.
 - Claude models keep working normally at the same time (passthrough path). That does not mean a
   subagent invocation can mix in a gateway id freely: the `Agent` tool's own `model` parameter is a
   fixed host enum (`sonnet`/`opus`/`haiku`/`fable`), independent of gateway or plugin state, and a

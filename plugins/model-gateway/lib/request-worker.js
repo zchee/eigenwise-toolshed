@@ -18,7 +18,10 @@ const grokBackend = require('./grok-backend.js');
 const { fetchUrl } = require('./process-supervision.js');
 const { effectiveBaseUrl, wiredMode } = require('./settings-wiring.js');
 const { detectHostsCompat } = require('./remote-control.js');
-const { codexBaseFromId, ourBaseUrls } = require('./pins.js');
+const { ourBaseUrls, proxyRouteFromId } = require('./pins.js');
+const {
+  modelsFileRoutes, parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes, setProxyModelRoutes,
+} = require('./proxy-models.js');
 const { createAnthropicCatalog, advertisedAnthropicRows, withCachedAnthropicRows } = require('./anthropic-catalog.js');
 const { withPreviousServerRows } = require('./previous-picker-rows.js');
 const { ToolSchemaCompatibilityError, adaptCodexToolSchemas } = require('./tool-schema-compat.js');
@@ -27,7 +30,7 @@ const {
   setUpstreamBlocked, setUpstreamUnavailable,
 } = require('./codex-upstream-state.js');
 const {
-  ANTHROPIC_UPSTREAM, AUTH_HEADERS, CODEX_FAMILY_RE, COMPAT_HOST,
+  ANTHROPIC_UPSTREAM, AUTH_HEADERS, COMPAT_HOST,
   COMPAT_PORT, DISPATCH_MODEL_ID, DISPATCH_ROUTE_CACHE_PATH, GROK_ENDPOINT, GROK_PREFIX, LIST_DISPATCH_MODEL,
   PLUGIN_VERSION, PROXY_BIN, PROXY_PORT, REQUEST_ROUTE_LOG,
   REQUEST_ROUTE_LOG_PATH, ROUTE_TELEMETRY_ENABLED, ROUTE_TELEMETRY_TIMEOUT_MS, SHIM_PORT, SOCKET_PATH,
@@ -209,12 +212,12 @@ function servingVersionIsCurrentOrNewer(servingVersion, installedVersion) {
 
 function displayName(id, backend = 'codex') {
   if (backend === 'grok') return id.replace(/^grok-/, 'Grok ').replace(/-/g, ' ');
+  if (backend !== 'codex') return proxyModelDisplayName(id, backend);
   return id.replace(/^gpt-/, 'GPT-').replace(/\[1m\]$/, '') + ' (Codex)';
 }
 
-// claude-code-proxy v0.1.10 has no /v1/models route, so the shim owns the
-// catalog: ~/.claude/model-gateway/models.json if present, else the Codex ids
-// its README documents. A future proxy /v1/models takes precedence over both.
+// The proxy's /v1/models is the catalog. When it cannot be read, the shim falls
+// back to ~/.claude/model-gateway/models.json, then to these Codex ids.
 const PLAN_TOOLS = ['EnterPlanMode', 'ExitPlanMode'];
 
 const DEFAULT_MODELS = [
@@ -222,42 +225,12 @@ const DEFAULT_MODELS = [
 ];
 const DEFAULT_GROK_MODELS = grokBackend.GROK_MODELS;
 
-// Advertising an id the router can't claim back would hand it to
-// api.anthropic.com, so a local models.json is held to the same family rule.
-function isRoutableCodexId(id) {
-  return typeof id === 'string' && (id === 'auto' || CODEX_FAMILY_RE.test(id));
-}
-
-function routableCodexIds(ids) {
-  const routable = Array.isArray(ids) ? ids.filter(isRoutableCodexId) : [];
-  return routable.length ? routable : null;
-}
-
-async function proxyCodexIds() {
-  try {
-    const response = await fetchUrl(`http://127.0.0.1:${PROXY_PORT}/v1/models`, { timeout: 2500 });
-    if (response.status !== 200) return null;
-    return (JSON.parse(response.body.toString()).data || []).map((model) => model.id).filter((id) => /^gpt-/.test(id));
-  } catch { return null; }
-}
-
 function isGrokBackendModel(model) {
-  return resolveGatewayModelPolicy(model.id)?.backend === 'grok';
+  return resolveGatewayModelPolicy(model.id)?.transport === 'grok';
 }
 
 function localModelsFileIds() {
   try { return JSON.parse(fs.readFileSync(path.join(STATE, 'models.json'), 'utf8')); } catch { return null; }
-}
-
-// Only a list the proxy answered is a real catalog. models.json and the
-// built-in list stand in while the proxy is unreachable, which is routine for a
-// shim the supervisor starts alongside its proxy (GH-297).
-async function advertisedCodexCatalog() {
-  const proxyIds = routableCodexIds(await proxyCodexIds());
-  if (proxyIds) return { ids: proxyIds, source: 'proxy' };
-  const localIds = routableCodexIds(localModelsFileIds());
-  if (localIds) return { ids: localIds, source: 'models.json' };
-  return { ids: DEFAULT_MODELS, source: 'fallback' };
 }
 
 function statelessBackendThreadRefusal(payload) {
@@ -268,7 +241,7 @@ function statelessBackendThreadRefusal(payload) {
     type: 'error',
     error: {
       type: 'invalid_request_error',
-      message: 'capability_rejected: beta_header:message-threads-2026-08-12; model-gateway Codex and Grok backends hold no conversation state. Resend this turn with the full message history.',
+      message: 'capability_rejected: beta_header:message-threads-2026-08-12; the model-gateway proxy and Grok backends hold no conversation state. Resend this turn with the full message history.',
       details: { error_code: 'thread_unsupported_request' },
     },
   };
@@ -914,7 +887,6 @@ function routeStatus(statusCode, override) {
   return 'ok';
 }
 
-const ROUTE_BACKENDS = new Set(['codex', 'anthropic']);
 const ROUTE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const ROUTE_VIAS = new Set(['direct', 'dispatch', 'dispatch-cached']);
 const COMPACT_TERMINAL_CODES = new Set(['message_stop']);
@@ -943,7 +915,7 @@ function routeSpanAttributes(identity, route, status, statusCode, durationMs) {
     otlpAttribute('session_id', identity.sessionId),
     otlpAttribute('selected_model', safeMetadataId(route.selectedModel)),
     otlpAttribute('effective_model', safeMetadataId(route.effectiveModel)),
-    otlpAttribute('backend', allowedValue(route.backend, ROUTE_BACKENDS)),
+    otlpAttribute('backend', typeof route.backend === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(route.backend) ? route.backend : null),
     otlpAttribute('effort', allowedValue(route.effort, ROUTE_EFFORTS)),
     otlpAttribute('fallback', route.fallback === true),
     otlpAttribute('via', allowedValue(route.via, ROUTE_VIAS)),
@@ -1108,7 +1080,7 @@ function runWorker() {
   process.once('disconnect', () => process.exit(0));
   let modelCache = {
     source: 'fallback',
-    data: [...DEFAULT_MODELS, ...(LIST_DISPATCH_MODEL ? ['auto'] : [])].map((id) => gatewayModel(id)),
+    data: [...DEFAULT_MODELS, ...(LIST_DISPATCH_MODEL ? ['auto'] : [])].map((id) => gatewayModel(id)).filter(Boolean),
   };
   const counters = { models: 0, codex: 0, grok: 0, anthropic: 0 };
   const dispatchRoutes = new DispatchSessionRouteCache({ cachePath: DISPATCH_ROUTE_CACHE_PATH });
@@ -1276,6 +1248,7 @@ function runWorker() {
     const state = sentrySession(sessionId, model);
     const usage = state?.usage || 0;
     if (state) state.fired = true;
+    if (!sentryPolicyFor(model)) return usage;
     const modelState = sentryModel(model);
     if (modelState.source === 'derived' && usage > CODEX_COMPACT_HEADROOM) {
       modelState.observedCeiling = modelState.observedCeiling == null
@@ -1302,8 +1275,8 @@ function runWorker() {
     return Buffer.from(JSON.stringify(parsed));
   }
 
-  function answerUpstreamFailure(clientRes, statusCode, resHeaders, upstreamBody) {
-    const authenticationFailure = codexAuthenticationFailure(upstreamBody, statusCode);
+  function answerUpstreamFailure(clientRes, statusCode, resHeaders, upstreamBody, proxyProvider) {
+    const authenticationFailure = proxyProvider === 'codex' && codexAuthenticationFailure(upstreamBody, statusCode);
     const responseBody = authenticationFailure || upstreamBody;
     if (authenticationFailure) resHeaders['content-type'] = 'application/json';
     resHeaders['content-length'] = responseBody.length;
@@ -1342,19 +1315,43 @@ function runWorker() {
   }
 
   async function refreshModels({ logSentryPolicies = false } = {}) {
-    const { ids, source } = await advertisedCodexCatalog();
+    let routes = [];
+    try {
+      const r = await fetchUrl(`http://127.0.0.1:${PROXY_PORT}/v1/models`, { timeout: 2500 });
+      if (r.status === 200) routes = parseProxyModelListing(JSON.parse(r.body.toString()).data);
+    } catch { /* proxy down or no such route */ }
+    // A refresh that cannot read the listing keeps the last one: dropping it would hand every
+    // non-Codex picker id to api.anthropic.com until the proxy answers again. Only a list the
+    // proxy answered is a real catalog; models.json and the built-in list stand in while the
+    // proxy is unreachable, which is routine for a shim the supervisor starts alongside it.
+    let source = modelCache.source;
+    if (routes.length) {
+      setProxyModelRoutes(routes);
+      source = 'proxy';
+    } else if (!proxyModelRoutes().length) {
+      routes = modelsFileRoutes(localModelsFileIds());
+      source = routes.length ? 'models.json' : 'fallback';
+      setProxyModelRoutes(routes.length ? routes : DEFAULT_MODELS.map((id) => ({ id, provider: 'codex' })));
+    }
+    routes = proxyModelRoutes();
+    // Rows this plugin's Grok backend serves are listed from the Grok CLI below, not from the proxy.
+    const proxyRows = routes.filter(({ id }) => resolveGatewayModelPolicy(id)?.transport === 'proxy');
     const grokModels = grokBackend.grokModelsFromCache();
     const advertisedGrokModels = grokModels.length ? grokModels : DEFAULT_GROK_MODELS;
     modelCache = {
       // A stand-in list is never persisted; the next refresh tick retries the proxy.
       source,
       data: [
-        ...[...ids.filter((id) => id !== 'auto'), ...(LIST_DISPATCH_MODEL ? ['auto'] : [])]
+        ...[...proxyRows.filter(({ provider }) => provider === 'codex').map(({ id }) => id), ...(LIST_DISPATCH_MODEL ? ['auto'] : [])]
           .map((id) => gatewayModel(id))
           .filter(Boolean),
         ...advertisedGrokModels
           .filter(isGrokBackendModel)
           .map((model) => gatewayModel(model.id, 'grok')),
+        ...proxyRows
+          .filter(({ provider }) => provider !== 'codex')
+          .map(({ id, provider }) => gatewayModel(id, provider))
+          .filter(Boolean),
       ],
     };
     if (logSentryPolicies) logAdvertisedSentryPolicies();
@@ -1413,15 +1410,15 @@ function runWorker() {
     });
   }
 
-  function rewriteResponseModel(value, advertisedModel) {
+  function rewriteResponseModel(value, advertisedModel, backendModel = null) {
     if (!value || typeof value !== 'object') return value;
     if (Array.isArray(value)) {
-      for (const item of value) rewriteResponseModel(item, advertisedModel);
+      for (const item of value) rewriteResponseModel(item, advertisedModel, backendModel);
       return value;
     }
     for (const [key, item] of Object.entries(value)) {
-      if (key === 'model' && typeof item === 'string' && item.startsWith('gpt-')) value[key] = advertisedModel;
-      else rewriteResponseModel(item, advertisedModel);
+      if (key === 'model' && typeof item === 'string' && (item.startsWith('gpt-') || (backendModel && item === backendModel))) value[key] = advertisedModel;
+      else rewriteResponseModel(item, advertisedModel, backendModel);
     }
     return value;
   }
@@ -1435,10 +1432,10 @@ function runWorker() {
     }
   }
 
-  function rewriteCodexJson(body, advertisedModel, filterPlanTools) {
+  function rewriteCodexJson(body, advertisedModel, filterPlanTools, backendModel = null) {
     let parsed;
     try { parsed = JSON.parse(body.toString()); } catch { return body; }
-    rewriteResponseModel(parsed, advertisedModel);
+    rewriteResponseModel(parsed, advertisedModel, backendModel);
     if (filterPlanTools && Array.isArray(parsed.content)) {
       const content = parsed.content.filter((block) => !filterPlanToolBlock(block));
       if (content.length !== parsed.content.length) {
@@ -1469,7 +1466,7 @@ function runWorker() {
     }));
   }
 
-  function createCodexSseTransformer(write, observe, advertisedModel, filterPlanTools) {
+  function createCodexSseTransformer(write, observe, advertisedModel, filterPlanTools, backendModel = null) {
     const decoder = new StringDecoder('utf8');
     let pending = '';
     const dropped = new Set();
@@ -1485,7 +1482,7 @@ function runWorker() {
       let event;
       try { event = JSON.parse(raw); } catch { return write(frame + separator); }
       if (observe) observe(event);
-      rewriteResponseModel(event, advertisedModel);
+      rewriteResponseModel(event, advertisedModel, backendModel);
 
       const originalIndex = Number.isInteger(event.index) ? event.index : null;
       if (filterPlanTools && event.type === 'content_block_start' && originalIndex != null) {
@@ -1623,7 +1620,7 @@ function runWorker() {
     arm();
   }
 
-  function forward(clientReq, clientRes, target, body, extraHeaderDrop = [], normalizeContextErrors = false, filterPlanTools = false, sessionId = null, advertisedModel = null, contextModel = null, routeTelemetry = null, usageCapture = null, webSocketUpgradeRetries = 0, compactGuard = null) {
+  function forward(clientReq, clientRes, target, body, extraHeaderDrop = [], proxyProvider = null, filterPlanTools = false, sessionId = null, advertisedModel = null, contextModel = null, routeTelemetry = null, usageCapture = null, webSocketUpgradeRetries = 0, compactGuard = null) {
     const url = new URL(clientReq.url, target);
     let finishUsage = () => usageCapture?.finish();
     if (usageCapture) clientRes.once('finish', () => finishUsage());
@@ -1666,9 +1663,9 @@ function runWorker() {
           });
           routeTelemetry?.finish(upRes.statusCode, statusOverride);
           // The status line is gone but the sentry's learned ceiling is not.
-          if (normalizeContextErrors && SENTRY_ENABLED && upRes.statusCode === 413) noteGenuineOverflow(sessionId, contextModel);
-          if (normalizeContextErrors) noteCodexUpstreamRejection(upRes.statusCode, upRes.headers, Buffer.concat(chunks));
-          const authenticationFailure = codexAuthenticationFailure(Buffer.concat(chunks), upRes.statusCode);
+          if (proxyProvider && SENTRY_ENABLED && upRes.statusCode === 413) noteGenuineOverflow(sessionId, contextModel);
+          if (proxyProvider === 'codex') noteCodexUpstreamRejection(upRes.statusCode, upRes.headers, Buffer.concat(chunks));
+          const authenticationFailure = proxyProvider === 'codex' && codexAuthenticationFailure(Buffer.concat(chunks), upRes.statusCode);
           const error = authenticationFailure ? JSON.parse(authenticationFailure).error : {
             type: 'api_error',
             message: upstreamErrorMessage(Buffer.concat(chunks), upRes.statusCode),
@@ -1685,7 +1682,7 @@ function runWorker() {
         upRes.on('aborted', () => report('upstream_aborted'));
         return;
       }
-      if (normalizeContextErrors && upRes.statusCode === 403) {
+      if (proxyProvider && upRes.statusCode === 403) {
         const chunks = [];
         upRes.on('data', (chunk) => {
           usageCapture?.noteResponseBytes(chunk.length);
@@ -1702,11 +1699,11 @@ function runWorker() {
         upRes.on('end', () => {
           const upstreamBody = Buffer.concat(chunks);
           if (!isWebSocketUpgradeRejection(upRes.statusCode, upstreamBody)) {
-            noteCodexUpstreamRejection(upRes.statusCode, upRes.headers, upstreamBody);
+            if (proxyProvider === 'codex') noteCodexUpstreamRejection(upRes.statusCode, upRes.headers, upstreamBody);
             usageCapture?.setResponse(upRes.statusCode, upRes.headers);
             routeTelemetry?.finish(upRes.statusCode);
-            const authenticationFailure = codexAuthenticationFailure(upstreamBody, upRes.statusCode);
-            const rewritten = authenticationFailure || rewriteCodexJson(upstreamBody, advertisedModel, false);
+            const authenticationFailure = proxyProvider === 'codex' && codexAuthenticationFailure(upstreamBody, upRes.statusCode);
+            const rewritten = authenticationFailure || rewriteCodexJson(upstreamBody, advertisedModel, false, contextModel);
             if (authenticationFailure) resHeaders['content-type'] = 'application/json';
             resHeaders['content-length'] = rewritten.length;
             clientRes.writeHead(upRes.statusCode, resHeaders);
@@ -1714,7 +1711,7 @@ function runWorker() {
           }
           if (webSocketUpgradeRetries < WEBSOCKET_UPGRADE_RETRIES) {
             return setTimeout(() => forward(clientReq, clientRes, target, body, extraHeaderDrop,
-              normalizeContextErrors, filterPlanTools, sessionId, advertisedModel, contextModel, routeTelemetry,
+              proxyProvider, filterPlanTools, sessionId, advertisedModel, contextModel, routeTelemetry,
               usageCapture, webSocketUpgradeRetries + 1, compactGuard), WEBSOCKET_UPGRADE_RETRY_DELAY_MS);
           }
           const transientError = transientWebSocketUpgradeError(webSocketUpgradeRetries + 1);
@@ -1738,13 +1735,13 @@ function runWorker() {
       }
       const codexInferenceResponse = advertisedModel && successful2xx;
       const compactStream = compactGuard && codexInferenceResponse && streamedContentType;
-      const bufferedContextFailure = normalizeContextErrors && upRes.statusCode >= 400;
+      const bufferedContextFailure = proxyProvider && upRes.statusCode >= 400;
       if (!compactStream && !bufferedContextFailure && !codexInferenceResponse) {
         upRes.once('end', () => routeTelemetry?.finish(upRes.statusCode));
         upRes.once('aborted', () => routeTelemetry?.finish(upRes.statusCode, 'upstream_aborted'));
         upRes.once('error', () => routeTelemetry?.finish(upRes.statusCode, 'upstream_error'));
       }
-      if (normalizeContextErrors && SENTRY_ENABLED && upRes.statusCode === 413) {
+      if (proxyProvider && SENTRY_ENABLED && upRes.statusCode === 413) {
         const chunks = [];
         let settled = false;
         const failBufferedResponse = (statusOverride) => {
@@ -1767,7 +1764,7 @@ function runWorker() {
           if (settled) return;
           settled = true;
           const normalized = rewriteCodexJson(
-            normalizeGenuineContextOverflow(Buffer.concat(chunks), body, sessionId, contextModel, routeTelemetry), advertisedModel, false);
+            normalizeGenuineContextOverflow(Buffer.concat(chunks), body, sessionId, contextModel, routeTelemetry), advertisedModel, false, contextModel);
           routeTelemetry.finish(413);
           resHeaders['content-length'] = normalized.length;
           clientRes.writeHead(413, resHeaders);
@@ -1777,7 +1774,7 @@ function runWorker() {
       }
       // Older proxies may signal overflow with a differently-shaped 4xx/5xx.
       // Buffer only those failures and normalize them to request_too_large.
-      if (normalizeContextErrors && upRes.statusCode >= 400 && upRes.statusCode !== 413) {
+      if (proxyProvider && upRes.statusCode >= 400 && upRes.statusCode !== 413) {
         const chunks = [];
         let settled = false;
         const failBufferedResponse = (statusOverride) => {
@@ -1799,12 +1796,12 @@ function runWorker() {
         upRes.on('end', () => {
           if (settled) return;
           settled = true;
-          const upstreamBody = rewriteCodexJson(Buffer.concat(chunks), advertisedModel, false);
-          if (answerEmptyCodexCompletion(upRes.statusCode, upstreamBody, body, advertisedModel, clientRes, routeTelemetry)) return;
-          noteCodexUpstreamRejection(upRes.statusCode, upRes.headers, upstreamBody);
+          const upstreamBody = rewriteCodexJson(Buffer.concat(chunks), advertisedModel, false, contextModel);
+          if (proxyProvider === 'codex' && answerEmptyCodexCompletion(upRes.statusCode, upstreamBody, body, advertisedModel, clientRes, routeTelemetry)) return;
+          if (proxyProvider === 'codex') noteCodexUpstreamRejection(upRes.statusCode, upRes.headers, upstreamBody);
           if (answerLegacyContextOverflow(upstreamBody, body, sessionId, contextModel, clientRes, routeTelemetry, upRes.statusCode)) return;
           routeTelemetry.finish(upRes.statusCode);
-          answerUpstreamFailure(clientRes, upRes.statusCode, resHeaders, upstreamBody);
+          answerUpstreamFailure(clientRes, upRes.statusCode, resHeaders, upstreamBody, proxyProvider);
         });
         return;
       }
@@ -1817,7 +1814,7 @@ function runWorker() {
         upRes.on('error', () => clientRes.destroy());
         upRes.on('aborted', () => clientRes.destroy());
         upRes.on('end', () => {
-          const rewritten = rewriteCodexJson(Buffer.concat(chunks), advertisedModel, false);
+          const rewritten = rewriteCodexJson(Buffer.concat(chunks), advertisedModel, false, contextModel);
           resHeaders['content-length'] = rewritten.length;
           clientRes.writeHead(upRes.statusCode, resHeaders);
           clientRes.end(rewritten);
@@ -1852,7 +1849,7 @@ function runWorker() {
               attempt.chunks.length = 0;
             }
             : (chunk) => clientRes.write(chunk);
-          const filter = createCodexSseTransformer(emit, observeEvent, advertisedModel, filterPlanTools);
+          const filter = createCodexSseTransformer(emit, observeEvent, advertisedModel, filterPlanTools, contextModel);
           upRes.on('data', (chunk) => {
             usageCapture?.noteResponseBytes(chunk.length);
             filter.write(chunk);
@@ -1893,7 +1890,7 @@ function runWorker() {
               compactGuard.attempts++;
               upRes.destroy();
               return setTimeout(() => forward(clientReq, clientRes, target, body, extraHeaderDrop,
-                normalizeContextErrors, filterPlanTools, sessionId, advertisedModel, contextModel, routeTelemetry,
+                proxyProvider, filterPlanTools, sessionId, advertisedModel, contextModel, routeTelemetry,
                 usageCapture, webSocketUpgradeRetries, compactGuard), COMPACT_STREAM_RETRY_DELAY_MS);
             }
             const outcome = compactOutcome(attempt, upRes.statusCode, statusOverride);
@@ -1919,7 +1916,7 @@ function runWorker() {
             if (!deliverable && !attempt.sawError) {
               const attempts = compactGuard.attempts + 1;
               clientRes.write(sseErrorFrame('api_error',
-                `model-gateway: the Codex compaction stream ended without a completed generation after ${attempts} attempt(s); the summary above is incomplete`));
+                `model-gateway: the ${providerLabel(proxyProvider)} compaction stream ended without a completed generation after ${attempts} attempt(s); the summary above is incomplete`));
             }
             clientRes.end();
           };
@@ -1948,7 +1945,7 @@ function runWorker() {
               && !isCompactionRequest(JSON.parse(body));
             recordSentryUsage(sessionId, { type: 'message_delta', usage: response.usage }, contextModel, ordinaryTurnCompleted);
           }
-          const filtered = rewriteCodexJson(upstreamBody, advertisedModel, filterPlanTools);
+          const filtered = rewriteCodexJson(upstreamBody, advertisedModel, filterPlanTools, contextModel);
           routeTelemetry?.finish(upRes.statusCode, completed ? null : 'upstream_error');
           resHeaders['content-length'] = filtered.length;
           clientRes.writeHead(upRes.statusCode, resHeaders);
@@ -1960,8 +1957,8 @@ function runWorker() {
       const successful = upRes.statusCode >= 200 && upRes.statusCode < 300;
       clientRes.writeHead(upRes.statusCode, resHeaders);
       if (successful && contentType.includes('text/event-stream')) {
-        if (normalizeContextErrors) keepSseAlive(upRes, clientRes);
-        const observeSentry = normalizeContextErrors && SENTRY_ENABLED && sessionId;
+        if (proxyProvider) keepSseAlive(upRes, clientRes);
+        const observeSentry = proxyProvider && SENTRY_ENABLED && sessionId;
         if (observeSentry || usageCapture) {
           const observer = createSseEventObserver(
             (event) => {
@@ -2222,7 +2219,9 @@ function runWorker() {
           parsedPayload = parsed;
           requestedModel = typeof parsed.model === 'string' ? parsed.model : null;
           requestedEffort = typeof parsed.output_config?.effort === 'string' ? parsed.output_config.effort : null;
-          const requestedBase = codexBaseFromId(parsed.model);
+          const proxyRoute = proxyRouteFromId(parsed.model);
+          const requestedBase = proxyRoute?.base ?? null;
+          const provider = proxyRoute?.provider ?? null;
           if (requestedBase) {
             const advertisedModel = parsed.model;
             const threadRefusal = pathOnly === '/v1/messages' && statelessBackendThreadRefusal(parsed);
@@ -2231,7 +2230,7 @@ function runWorker() {
               routeTelemetry.setRoute({
                 selectedModel: advertisedModel,
                 effectiveModel: requestedBase === 'auto' ? null : requestedBase,
-                backend: 'codex',
+                backend: provider,
                 effort: requestedEffort,
                 fallback: false,
                 via: requestedBase === 'auto' ? 'dispatch' : 'direct',
@@ -2277,13 +2276,13 @@ function runWorker() {
                 routeTelemetry.setRoute({
                   selectedModel: advertisedModel,
                   effectiveModel: null,
-                  backend: 'codex',
+                  backend: provider,
                   effort: null,
                   fallback: false,
                   via: 'dispatch',
                 });
                 routeTelemetry.finish(400, 'invalid_route');
-                requestRouteLog(req, 'codex', advertisedModel, pathOnly, 'dispatch-unbound', null, dispatchIdentity, dispatchMarkersLength);
+                requestRouteLog(req, provider, advertisedModel, pathOnly, 'dispatch-unbound', null, dispatchIdentity, dispatchMarkersLength);
                 res.writeHead(400, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
                 return res.end(body);
               }
@@ -2296,7 +2295,7 @@ function runWorker() {
             }
             resolveCodexDeferredTools(parsed);
             try {
-              parsed.tools = adaptCodexToolSchemas(parsed.tools);
+              if (provider === 'codex') parsed.tools = adaptCodexToolSchemas(parsed.tools);
             } catch (error) {
               const compatibilityError = error instanceof ToolSchemaCompatibilityError ? error : null;
               const toolName = compatibilityError?.toolName || '<unnamed tool>';
@@ -2312,7 +2311,7 @@ function runWorker() {
               routeTelemetry.setRoute({
                 selectedModel: advertisedModel,
                 effectiveModel: parsed.model,
-                backend: 'codex',
+                backend: provider,
                 effort: typeof parsed.output_config?.effort === 'string' ? parsed.output_config.effort : requestedEffort,
                 fallback: false,
                 via: dispatchVia || 'direct',
@@ -2330,14 +2329,14 @@ function runWorker() {
             if (Array.isArray(parsed.tools) && !keepPlanTools) {
               parsed.tools = parsed.tools.filter((t) => !PLAN_TOOLS.includes(t && t.name));
             }
-            counters.codex++;
+            counters[provider] = (counters[provider] || 0) + 1;
             const effectiveEffort = typeof parsed.output_config?.effort === 'string' ? parsed.output_config.effort : requestedEffort;
-            requestRouteLog(req, 'codex', parsed.model, pathOnly, dispatchVia, effectiveEffort,
+            requestRouteLog(req, provider, parsed.model, pathOnly, dispatchVia, effectiveEffort,
               dispatchIdentity, dispatchMarkersLength, dispatchInheritedFromAgentId);
             routeTelemetry.setRoute({
               selectedModel: advertisedModel,
               effectiveModel: parsed.model,
-              backend: 'codex',
+              backend: provider,
               effort: effectiveEffort,
               fallback: false,
               via: dispatchVia || 'direct',
@@ -2358,7 +2357,7 @@ function runWorker() {
                 route: {
                   requestedModel: advertisedModel,
                   effectiveModel: parsed.model,
-                  backend: 'codex',
+                  backend: provider,
                   effort: effectiveEffort,
                   via: dispatchVia || 'direct',
                   ticketRef: dispatchVia === 'dispatch-inherited' ? null : dispatchRoute?.ticket || null,
@@ -2370,7 +2369,7 @@ function runWorker() {
               : null;
             // claude.ai credentials never leave this machine toward the proxy
             return forward(req, res, `http://127.0.0.1:${PROXY_PORT}`,
-              forwardedBody, AUTH_HEADERS, true, !keepPlanTools, sessionId, advertisedModel, parsed.model, routeTelemetry,
+              forwardedBody, AUTH_HEADERS, provider, !keepPlanTools, sessionId, advertisedModel, parsed.model, routeTelemetry,
               usageCapture, 0, compactGuard);
           }
         } catch { /* not JSON; fall through to passthrough */ }
@@ -2455,7 +2454,7 @@ function runWorker() {
           },
         })
         : null;
-      forward(req, res, ANTHROPIC_UPSTREAM, raw, [], false, false, null, null, null, routeTelemetry, usageCapture);
+      forward(req, res, ANTHROPIC_UPSTREAM, raw, [], null, false, null, null, null, routeTelemetry, usageCapture);
     });
   }
 

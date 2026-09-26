@@ -9,17 +9,27 @@ const {
   CLAUDE_BIN, CLAUDE_BIN_IS_BATCH, CODEX_FAMILY_RE, COMPAT_BASE_URL, DEFAULT_BASE_URL,
   DISPATCH_MODEL_ID, GROK_PREFIX, KNOWN_GOOD_PINS, LEGACY_CODEX_PREFIX, PIN_ALIASES,
   PIN_CACHE_PATH, PIN_CACHE_TTL_MS, PIN_OVERRIDE_PATH, PIN_PROBE_TIMEOUT_MS, PREFIX,
-  RETIRED_SHIPPED_PINS, STATE, STATIC_ENV_BLOCK, WIN,
+  RETIRED_SHIPPED_PINS, STATE, STATIC_ENV_BLOCK, WIN, resolveGatewayModelPolicy,
 } = require('./runtime.js');
 
-function codexBaseFromId(id) {
+// The claude-code-proxy provider and backend id a picker id is forwarded as, or null when the id
+// belongs to this plugin's Grok backend or to api.anthropic.com.
+function proxyRouteFromId(id) {
   if (typeof id !== 'string') return null;
   const bare = id.replace(/\[1m\]$/, '');
-  if (bare === DISPATCH_MODEL_ID) return 'auto';
-  const base = bare.startsWith(LEGACY_CODEX_PREFIX) ? bare.slice(LEGACY_CODEX_PREFIX.length)
-    : bare.startsWith(PREFIX) ? bare.slice(PREFIX.length)
-      : null;
-  return base && CODEX_FAMILY_RE.test(base) ? base : null;
+  if (bare === DISPATCH_MODEL_ID) return { provider: 'codex', base: 'auto' };
+  if (bare.startsWith(LEGACY_CODEX_PREFIX)) {
+    const base = bare.slice(LEGACY_CODEX_PREFIX.length);
+    return CODEX_FAMILY_RE.test(base) ? { provider: 'codex', base } : null;
+  }
+  if (!bare.startsWith(PREFIX)) return null;
+  const policy = resolveGatewayModelPolicy(bare);
+  return policy?.transport === 'proxy' ? { provider: policy.backend, base: policy.backendId } : null;
+}
+
+function codexBaseFromId(id) {
+  const route = proxyRouteFromId(id);
+  return route?.provider === 'codex' ? route.base : null;
 }
 
 function pinVersion(value) {
@@ -42,7 +52,7 @@ function comparePinVersions(first, second) {
 }
 
 function isGatewayModelId(id) {
-  return codexBaseFromId(id) != null || (typeof id === 'string' && id.startsWith(GROK_PREFIX));
+  return proxyRouteFromId(id) != null || (typeof id === 'string' && id.startsWith(GROK_PREFIX));
 }
 
 function isValidPin(value) {
@@ -467,6 +477,6 @@ function ourBaseUrls() { return [DEFAULT_BASE_URL, COMPAT_BASE_URL]; }
 
 module.exports = {
   claudeVersion, codexBaseFromId, comparePinVersions, detectedPinDefaults, FABLE_OPTION_KEYS, modelDisplayName, pinVersion, terminateProbe, effectivePins, envBlockFor, gatewayEnvBlock, isGatewayModelId,
-  isValidPin, ourBaseUrls, ownedPinValues, pinEnvBlock, pinProvenance, probeClaudeAlias, readPinOverrides, realClaudeRefusedUnderTest,
+  isValidPin, ourBaseUrls, ownedPinValues, pinEnvBlock, pinProvenance, probeClaudeAlias, proxyRouteFromId, readPinOverrides, realClaudeRefusedUnderTest,
   refreshDetectedPins, refreshCatalogPins, newestCatalogPins, stalePinUpdates, writePinOverrides,
 };

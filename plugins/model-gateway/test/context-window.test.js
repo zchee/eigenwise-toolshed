@@ -225,7 +225,10 @@ test('window policy marks measured rows and advertises unmeasured Codex defaults
     ...MODEL_WINDOW_POLICY.default,
     backendId: 'gpt-5.2',
     pickerAlias: 'claude-gpt-5.2[1m]',
+    transport: 'proxy',
   });
+  assert.equal(resolveGatewayModelPolicy('claude-grok-4.7[1m]').transport, 'grok');
+  assert.equal(resolveGatewayModelPolicy('claude-opus-4-8[1m]').transport, 'anthropic');
   assert.equal(gatewayClientModelId('gpt-5.2'), 'claude-gpt-5.2[1m]');
   assert.equal(resolveGatewayModelPolicy('claude-opus-4-8[1m]').sentry, 'none');
   assert.equal(gatewayModel('gpt-6-astra-fast', 'codex').max_input_tokens, 272000);

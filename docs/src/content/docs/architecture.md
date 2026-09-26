@@ -16,7 +16,8 @@ flowchart LR
   S --> E[Executors]
   CC --> W[Model Gateway shim]
   W --> P[Local proxy]
-  P --> API[Claude or Codex backend]
+  W --> AN[Anthropic API for Claude models]
+  P --> API[Codex, Kimi, Cursor, OpenCode Go, and Grok backends]
 ```
 
 - Quartermaster owns the cross-plugin setup plan for new and existing projects, updates Toolshed plugins, and checks workspace health.

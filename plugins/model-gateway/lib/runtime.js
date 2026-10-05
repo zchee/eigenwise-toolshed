@@ -272,8 +272,13 @@ function gatewayBackendModelId(id) {
   return typeof id === 'string' ? id.replace(/\[1m\]$/, '').replace(/^claude-/, '') : '';
 }
 
+// claude-code-proxy lists a Codex model's service tiers as suffixed ids (`-fast` for priority,
+// `-ultrafast` where the model offers it). A tier changes latency and price, not the model, so a
+// suffixed id shares its base model's window policy.
+const CODEX_SERVICE_TIER_SUFFIX = /-(?:ultra)?fast$/;
+
 function codexContextWindowModelId(id) {
-  const baseId = gatewayBackendModelId(id).replace(/-fast$/, '');
+  const baseId = gatewayBackendModelId(id).replace(CODEX_SERVICE_TIER_SUFFIX, '');
   return baseId || 'default';
 }
 
@@ -303,7 +308,7 @@ function policyTransport(policy) {
 
 function resolveGatewayModelPolicy(id) {
   const backendId = gatewayBackendModelId(id);
-  const policyId = backendId.startsWith('gpt-') ? backendId.replace(/-fast$/, '') : backendId;
+  const policyId = backendId.startsWith('gpt-') ? backendId.replace(CODEX_SERVICE_TIER_SUFFIX, '') : backendId;
   const provider = proxyModelProvider(backendId);
   const policy = (policyId !== 'default' && Object.hasOwn(MODEL_WINDOW_POLICY, policyId) ? MODEL_WINDOW_POLICY[policyId] : null)
     || (backendId.startsWith('gpt-') ? MODEL_WINDOW_POLICY.default : null)

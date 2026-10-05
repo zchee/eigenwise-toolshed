@@ -110,7 +110,7 @@ const MODEL_WINDOW_POLICY = Object.freeze({
     measurement: 'measured 2026-09-23 from Grok CLI models_cache.json (context_window 500000)',
     pickerAlias: 'claude-grok-4.7[1m]',
     advertisedWindow: 500000,
-    sentry: 'none',
+    sentry: 'synthetic-413',
   }),
   'grok-4.6': Object.freeze({
     backend: 'grok',
@@ -119,7 +119,7 @@ const MODEL_WINDOW_POLICY = Object.freeze({
     measurement: 'measured 2026-09-15 from Grok CLI models_cache.json (context_window 500000)',
     pickerAlias: 'claude-grok-4.6[1m]',
     advertisedWindow: 500000,
-    sentry: 'none',
+    sentry: 'synthetic-413',
   }),
   'grok-4.5': Object.freeze({
     backend: 'grok',

@@ -128,9 +128,9 @@ test('the shim advertises every proxy provider row and none of its Claude aliase
   const listed = JSON.parse((await request(port, 'GET', '/v1/models')).body).data;
 
   assert.deepEqual(listed, [
-    { id: 'claude-gpt-6-astra[1m]', display_name: 'GPT-6-astra (Codex)', type: 'model', max_input_tokens: 920000 },
-    { id: 'claude-gpt-6-sol[1m]', display_name: 'GPT-6-sol (Codex)', type: 'model', max_input_tokens: 920000 },
-    { id: 'claude-gpt-6-sol-fast[1m]', display_name: 'GPT-6-sol-fast (Codex)', type: 'model', max_input_tokens: 920000 },
+    { id: 'claude-gpt-6-astra[1m]', display_name: 'GPT-6-astra (Codex)', type: 'model', max_input_tokens: 272000 },
+    { id: 'claude-gpt-6-sol[1m]', display_name: 'GPT-6-sol (Codex)', type: 'model', max_input_tokens: 272000 },
+    { id: 'claude-gpt-6-sol-fast[1m]', display_name: 'GPT-6-sol-fast (Codex)', type: 'model', max_input_tokens: 272000 },
     { id: 'claude-grok-4.7[1m]', display_name: 'Grok 4.7', type: 'model', max_input_tokens: 500000 },
     { id: 'claude-grok-4.6[1m]', display_name: 'Grok 4.6', type: 'model', max_input_tokens: 500000 },
     { id: 'claude-grok-4.5[1m]', display_name: 'Grok 4.5', type: 'model', max_input_tokens: 500000 },
@@ -299,7 +299,11 @@ test('the Sidequest catalog lists every proxy provider under its own slug and re
     'claude-opus-5-5',
   ], codexReadiness);
 
-  assert.deepEqual(catalog.models, [
+  // contextWindow follows the saved per-backend cap, so it is checked against the runtime's own answer.
+  const { gatewayAdvertisedWindow } = require('../lib/runtime.js');
+  for (const model of catalog.models) assert.equal(model.contextWindow, gatewayAdvertisedWindow(model.id), model.id);
+  assert.equal(typeof catalog.models[0].contextWindowNote, 'string');
+  assert.deepEqual(catalog.models.map(({ contextWindow, contextWindowNote, ...model }) => model), [
     { slug: 'codex-gpt-6-sol', id: 'claude-gpt-6-sol[1m]', label: 'GPT-6 Sol', provider: 'codex' },
     { slug: 'kimi-k3', id: 'claude-kimi-k3', label: 'kimi-k3 (Kimi)', provider: 'kimi' },
     { slug: 'opencode-glm-5-3', id: 'claude-glm-5.3', label: 'glm-5.3 (OpenCode)', provider: 'opencode' },

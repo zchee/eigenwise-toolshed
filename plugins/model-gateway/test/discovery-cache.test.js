@@ -274,6 +274,8 @@ test('a shim that starts before its proxy serves the fallback catalog without pe
   await waitUntil(() => fs.existsSync(cache), 'the first refresh tick after the proxy answered did not write the discovery cache');
   assert.deepEqual(JSON.parse(fs.readFileSync(cache, 'utf8')).models, [
     { id: 'claude-gpt-6-astra[1m]', display_name: 'GPT-6-astra (Codex)' },
+    { id: 'claude-grok-4.7[1m]', display_name: 'Grok 4.7' },
+    { id: 'claude-grok-4.6[1m]', display_name: 'Grok 4.6' },
     { id: 'claude-grok-4.5[1m]', display_name: 'Grok 4.5' },
   ]);
   assert.equal((await getJson(`${baseUrl}/healthz`)).catalog, 'proxy');

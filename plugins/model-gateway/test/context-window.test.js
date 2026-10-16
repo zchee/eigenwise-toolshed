@@ -228,7 +228,7 @@ test('window policy marks measured rows and advertises unmeasured Codex defaults
     transport: 'proxy',
   });
   assert.equal(resolveGatewayModelPolicy('claude-grok-4.7[1m]').transport, 'grok');
-  assert.equal(resolveGatewayModelPolicy('claude-grok-4.7[1m]').backendWindow, 256000);
+  assert.equal(resolveGatewayModelPolicy('claude-grok-4.7[1m]').backendWindow, 500000);
   const fastTests = {
     'local alias': { id: 'claude-grok-4.7-fast[1m]', backendId: 'grok-4.7-fast' },
     'backend id': { id: 'claude-grok-4.7-build-fast[1m]', backendId: 'grok-4.7-build-fast' },
@@ -238,10 +238,10 @@ test('window policy marks measured rows and advertises unmeasured Codex defaults
     assert.equal(fast.transport, 'proxy', `${name}: only claude-code-proxy serves Grok 4.7 Fast`);
     assert.equal(fast.backend, 'grok', `${name}: the Grok cap and compact-at apply`);
     assert.equal(fast.backendId, backendId, name);
-    assert.equal(fast.backendWindow, 256000, name);
+    assert.equal(fast.backendWindow, MODEL_WINDOW_POLICY['grok-4.7'].backendWindow, `${name}: Fast is Grok 4.7 on faster infrastructure`);
     assert.equal(fast.pickerAlias, `claude-${backendId}[1m]`, name);
     assert.equal(fast.sentry, 'synthetic-413', name);
-    assert.equal(gatewayModel(backendId, 'grok').max_input_tokens, 256000, name);
+    assert.equal(gatewayModel(backendId, 'grok').max_input_tokens, 500000, name);
   }
   assert.equal(resolveGatewayModelPolicy('claude-opus-4-8[1m]').transport, 'anthropic');
   assert.equal(gatewayClientModelId('gpt-5.2'), 'claude-gpt-5.2[1m]');

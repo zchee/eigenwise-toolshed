@@ -245,7 +245,7 @@ test('context-window preserves saved compact-at across cap updates and removal r
   const saved = run('context-window', '--codex-compact-at', '242000', '--grok-compact-at', '900000');
   assert.equal(saved.status, 0, saved.stderr);
   assert.match(saved.stdout, /codex: 272000 cap \[default\]; requested compact-at 242000; backend window 920000; effective maximum 242000 \(compact-at\)/);
-  assert.match(saved.stdout, /grok: full.*requested compact-at 900000; backend window 256000 \(grok-4\.7\); effective maximum 216000 \(derived\)/);
+  assert.match(saved.stdout, /grok: full.*requested compact-at 900000; backend window 500000 \(grok-4\.7\); effective maximum 460000 \(derived\)/);
   assert.match(saved.stdout, /CODEX_GATEWAY_COMPACT_TRIGGER=320000 ignored: compact-at is saved/);
   assert.match(saved.stdout, /crossing turn and compaction request can still exceed 272k and pay double/);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { compactAt: { codex: 242000, grok: 900000 } });

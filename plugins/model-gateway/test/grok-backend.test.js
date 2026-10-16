@@ -138,7 +138,7 @@ test('reads the current Grok catalog from the CLI cache', (t) => {
   ]);
   assert.deepEqual(grok.grokModelIdsFromCache({ file }), ['grok-4.7', 'grok-4.6', 'grok-4.5']);
   assert.deepEqual(grok.GROK_MODELS, [
-    { id: 'grok-4.7', context: 256000, reasoning: true },
+    { id: 'grok-4.7', context: 500000, reasoning: true },
     { id: 'grok-4.6', context: 500000, reasoning: true },
     { id: 'grok-4.5', context: 500000, reasoning: true },
   ]);

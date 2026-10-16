@@ -7,7 +7,8 @@ const { writeFileAtomically } = require('./atomic-file.js');
 
 const GROK_ENDPOINT = 'https://cli-chat-proxy.grok.com/v1/responses';
 const GROK_TOKEN_ENDPOINT = 'https://auth.x.ai/oauth/token';
-const GROK_VERSION_FALLBACK = '0.2.112';
+// The backend answers a client version older than 1.0.13 with HTTP 426.
+const GROK_VERSION_FALLBACK = '1.0.60';
 const GROK_MODELS = [
   { id: 'grok-4.7', context: 500000, reasoning: true },
   { id: 'grok-4.6', context: 500000, reasoning: true },

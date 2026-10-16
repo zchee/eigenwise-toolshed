@@ -83,6 +83,24 @@ test('reads the CLI version and sends the required Grok headers', (t) => {
   assert.equal(headers['user-agent'], 'xai-grok-build/0.2.112');
 });
 
+test('the client version fallback is one the Grok backend accepts', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'model-gateway-grok-version-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const tests = {
+    'missing version.json uses the fallback': { contents: null, expected: grok.GROK_VERSION_FALLBACK },
+    'unparseable version.json uses the fallback': { contents: '{', expected: grok.GROK_VERSION_FALLBACK },
+    'the Grok CLI version wins over the fallback': { contents: JSON.stringify({ version: '1.0.61' }), expected: '1.0.61' },
+  };
+  for (const [name, { contents, expected }] of Object.entries(tests)) {
+    const file = path.join(directory, `${name.replace(/\W+/g, '-')}.json`);
+    if (contents !== null) fs.writeFileSync(file, contents);
+    assert.equal(grok.readGrokVersion({ file }), expected, name);
+  }
+  // The backend answers a client version older than 1.0.13 with HTTP 426.
+  const parts = grok.GROK_VERSION_FALLBACK.split('.').map(Number);
+  assert.ok(parts[0] > 1 || (parts[0] === 1 && (parts[1] > 0 || parts[2] >= 13)), `${grok.GROK_VERSION_FALLBACK} is below 1.0.13`);
+});
+
 test('reads the current Grok catalog from the CLI cache', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'model-gateway-grok-catalog-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -351,6 +369,6 @@ test('the shim lists and routes Grok 1M picker aliases', async (t) => {
   assert.equal(response.status, 200);
   assert.equal(JSON.parse(response.body).content[0].text, 'hello');
   assert.equal(observed[0].headers['x-grok-model-override'], 'grok-4.7');
-  assert.equal(observed[0].headers['x-grok-client-version'], '0.2.112');
+  assert.equal(observed[0].headers['x-grok-client-version'], '1.0.60');
   assert.deepEqual(observed[0].body.reasoning, { effort: 'high' });
 });

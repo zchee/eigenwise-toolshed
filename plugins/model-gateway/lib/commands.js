@@ -1300,8 +1300,10 @@ function policyGatewayModelIds(liveIds = []) {
       return policy && policy.backend !== 'anthropic';
     }))];
   }
+  // Without a live listing the worker serves the Codex fallback and this plugin's Grok rows, never a
+  // non-Codex proxy row, so expecting one would report it missing whenever the proxy is down.
   return Object.values(MODEL_WINDOW_POLICY)
-    .filter((policy) => policy.backendId !== 'default' && policy.backend !== 'anthropic')
+    .filter((policy) => policy.backendId !== 'default' && policy.backend !== 'anthropic' && policy.transport !== 'proxy')
     .map((policy) => policy.backendId);
 }
 

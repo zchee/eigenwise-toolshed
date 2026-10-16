@@ -228,6 +228,21 @@ test('window policy marks measured rows and advertises unmeasured Codex defaults
     transport: 'proxy',
   });
   assert.equal(resolveGatewayModelPolicy('claude-grok-4.7[1m]').transport, 'grok');
+  assert.equal(resolveGatewayModelPolicy('claude-grok-4.7[1m]').backendWindow, 256000);
+  const fastTests = {
+    'local alias': { id: 'claude-grok-4.7-fast[1m]', backendId: 'grok-4.7-fast' },
+    'backend id': { id: 'claude-grok-4.7-build-fast[1m]', backendId: 'grok-4.7-build-fast' },
+  };
+  for (const [name, { id, backendId }] of Object.entries(fastTests)) {
+    const fast = resolveGatewayModelPolicy(id);
+    assert.equal(fast.transport, 'proxy', `${name}: only claude-code-proxy serves Grok 4.7 Fast`);
+    assert.equal(fast.backend, 'grok', `${name}: the Grok cap and compact-at apply`);
+    assert.equal(fast.backendId, backendId, name);
+    assert.equal(fast.backendWindow, 256000, name);
+    assert.equal(fast.pickerAlias, `claude-${backendId}[1m]`, name);
+    assert.equal(fast.sentry, 'synthetic-413', name);
+    assert.equal(gatewayModel(backendId, 'grok').max_input_tokens, 256000, name);
+  }
   assert.equal(resolveGatewayModelPolicy('claude-opus-4-8[1m]').transport, 'anthropic');
   assert.equal(gatewayClientModelId('gpt-5.2'), 'claude-gpt-5.2[1m]');
   assert.equal(resolveGatewayModelPolicy('claude-opus-4-8[1m]').sentry, 'none');
@@ -1626,6 +1641,11 @@ test('doctor policy table includes gateway and native model rows', () => {
   assert.equal(rows.some((row) => row.backendId === 'grok-4.6' && row.pickerId === 'claude-grok-4.6[1m]'), true);
   assert.equal(rows.some((row) => row.backendId === 'grok-4.5' && row.pickerId === 'claude-grok-4.5[1m]'), true);
   assert.equal(rows.some((row) => row.backendId === 'claude-haiku-4-5' && row.sentry === 'none'), true);
+  // With no live listing the worker serves only Codex fallback rows and this plugin's Grok rows, so
+  // doctor must not expect a proxy-only Grok row and then report it missing.
+  assert.equal(rows.some((row) => row.backendId === 'grok-4.7-fast' || row.backendId === 'grok-4.7-build-fast'), false);
+  const liveRows = modelWindowPolicyRows(['grok-4.7-fast']);
+  assert.equal(liveRows.some((row) => row.backendId === 'grok-4.7-fast' && row.pickerId === 'claude-grok-4.7-fast[1m]'), true);
 
   // Hardcoding the alias ids here read the developer's own ~/.claude detected-pin cache: a machine that
   // had probed its CLI resolved fable to claude-fable-5 while the shipped constant says claude-fable-5-1,

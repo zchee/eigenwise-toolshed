@@ -103,13 +103,38 @@ const MODEL_WINDOW_POLICY = Object.freeze({
     advertisedWindow: 920000,
     sentry: 'synthetic-413',
   }),
+  // The Grok catalog also offers 4.7 a 500000 window, but no request field selects it, so a
+  // request from this backend or the proxy runs with the 256000 default and fails past it.
   'grok-4.7': Object.freeze({
     backend: 'grok',
     backendId: 'grok-4.7',
-    backendWindow: 500000,
-    measurement: 'measured 2026-09-23 from Grok CLI models_cache.json (context_window 500000)',
+    backendWindow: 256000,
+    measurement: 'catalog default 2026-10-16 per claude-code-proxy grok-4.7-fast branch (500000 not selectable); not a live probe',
     pickerAlias: 'claude-grok-4.7[1m]',
-    advertisedWindow: 500000,
+    advertisedWindow: 256000,
+    sentry: 'synthetic-413',
+  }),
+  // Grok 4.7 Fast is served only by claude-code-proxy, which sends both ids upstream as
+  // grok-4.7-build-fast; this plugin's Grok backend would get a 404 for grok-4.7-fast. transport
+  // is explicit because a 'grok' backend otherwise means this plugin's Grok backend.
+  'grok-4.7-fast': Object.freeze({
+    backend: 'grok',
+    transport: 'proxy',
+    backendId: 'grok-4.7-fast',
+    backendWindow: 256000,
+    measurement: 'catalog default 2026-10-16 per claude-code-proxy grok-4.7-fast branch (500000 not selectable); not a live probe',
+    pickerAlias: 'claude-grok-4.7-fast[1m]',
+    advertisedWindow: 256000,
+    sentry: 'synthetic-413',
+  }),
+  'grok-4.7-build-fast': Object.freeze({
+    backend: 'grok',
+    transport: 'proxy',
+    backendId: 'grok-4.7-build-fast',
+    backendWindow: 256000,
+    measurement: 'catalog default 2026-10-16 per claude-code-proxy grok-4.7-fast branch (500000 not selectable); not a live probe',
+    pickerAlias: 'claude-grok-4.7-build-fast[1m]',
+    advertisedWindow: 256000,
     sentry: 'synthetic-413',
   }),
   'grok-4.6': Object.freeze({

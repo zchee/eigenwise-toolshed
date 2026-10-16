@@ -18,6 +18,8 @@ const PROXY_LISTING = [
   ['gpt-6-sol-fast', 'codex'],
   ['cursor-agent', 'cursor'],
   ['grok-4.7', 'grok'],
+  ['grok-4.7-build-fast', 'grok'],
+  ['grok-4.7-fast', 'grok'],
   ['grok-composer-2.5-fast', 'grok'],
   ['kimi-k3', 'kimi'],
   ['glm-5.3', 'opencode'],
@@ -131,10 +133,12 @@ test('the shim advertises every proxy provider row and none of its Claude aliase
     { id: 'claude-gpt-6-astra[1m]', display_name: 'GPT-6-astra (Codex)', type: 'model', max_input_tokens: 272000 },
     { id: 'claude-gpt-6-sol[1m]', display_name: 'GPT-6-sol (Codex)', type: 'model', max_input_tokens: 272000 },
     { id: 'claude-gpt-6-sol-fast[1m]', display_name: 'GPT-6-sol-fast (Codex)', type: 'model', max_input_tokens: 272000 },
-    { id: 'claude-grok-4.7[1m]', display_name: 'Grok 4.7', type: 'model', max_input_tokens: 500000 },
+    { id: 'claude-grok-4.7[1m]', display_name: 'Grok 4.7', type: 'model', max_input_tokens: 256000 },
     { id: 'claude-grok-4.6[1m]', display_name: 'Grok 4.6', type: 'model', max_input_tokens: 500000 },
     { id: 'claude-grok-4.5[1m]', display_name: 'Grok 4.5', type: 'model', max_input_tokens: 500000 },
     { id: 'claude-cursor-agent', display_name: 'cursor-agent (Cursor)', type: 'model', max_input_tokens: 200000 },
+    { id: 'claude-grok-4.7-build-fast[1m]', display_name: 'Grok 4.7 build fast', type: 'model', max_input_tokens: 256000 },
+    { id: 'claude-grok-4.7-fast[1m]', display_name: 'Grok 4.7 fast', type: 'model', max_input_tokens: 256000 },
     { id: 'claude-grok-composer-2.5-fast', display_name: 'Grok composer 2.5 fast', type: 'model', max_input_tokens: 200000 },
     { id: 'claude-kimi-k3', display_name: 'kimi-k3 (Kimi)', type: 'model', max_input_tokens: 200000 },
     { id: 'claude-glm-5.3', display_name: 'glm-5.3 (OpenCode)', type: 'model', max_input_tokens: 200000 },
@@ -154,6 +158,8 @@ test('non-Codex rows reach the proxy under their backend id with credentials and
     'opencode row carrying its provider prefix': { model: 'claude-opencode-go/kimi-k2.6', backend: 'opencode-go/kimi-k2.6' },
     'cursor row': { model: 'claude-cursor-agent', backend: 'cursor-agent' },
     'Grok row only the proxy serves': { model: 'claude-grok-composer-2.5-fast', backend: 'grok-composer-2.5-fast' },
+    'Grok 4.7 Fast alias the proxy resolves upstream': { model: 'claude-grok-4.7-fast[1m]', backend: 'grok-4.7-fast' },
+    'Grok 4.7 Fast under its backend id': { model: 'claude-grok-4.7-build-fast[1m]', backend: 'grok-4.7-build-fast' },
   };
 
   for (const [name, { model, backend }] of Object.entries(tests)) {
@@ -356,4 +362,37 @@ test('a shim that starts before the proxy lists the proxy models without waiting
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   assert.ok(ids.includes('claude-kimi-k3'), `shim still served the fallback after ${listingReads} listing reads: ${ids.join(', ')}`);
+});
+
+test('Grok 4.7 Fast rows reach the proxy and compact 40000 below their 256000 window', async (t) => {
+  const tests = {
+    'local alias': { model: 'claude-grok-4.7-fast[1m]', backend: 'grok-4.7-fast' },
+    'backend id': { model: 'claude-grok-4.7-build-fast[1m]', backend: 'grok-4.7-build-fast' },
+  };
+  for (const [name, { model, backend }] of Object.entries(tests)) {
+    await t.test(name, async (st) => {
+      const proxy = await listingProxy(st, (body, res) => {
+        // The proxy-path sentry reads usage from the stream, which is how Claude Code asks.
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: {}, usage: { input_tokens: 216001, output_tokens: 1 } })}\n\n`
+          + 'event: message_stop\ndata: {"type":"message_stop"}\n\n');
+      });
+      const anthropic = await anthropicUpstream(st);
+      const { port } = await spawnShim(st, proxy.port, anthropic.url);
+      const session = { 'x-claude-code-session-id': `grok-fast-sentry-${backend}` };
+
+      const first = await request(port, 'POST', '/v1/messages', messageBody(model), session);
+      assert.equal(first.status, 200, `${name}: ${first.body}`);
+      assert.equal(proxy.received.length, 1, `${name}: the first turn reaches the proxy`);
+      assert.equal(proxy.received[0].body.model, backend, `${name}: the proxy gets the un-prefixed id and resolves the alias itself`);
+      assert.equal(anthropic.received.length, 0, `${name}: nothing reaches api.anthropic.com`);
+
+      const second = await request(port, 'POST', '/v1/messages', messageBody(model), session);
+      assert.equal(second.status, 413, `${name}: the turn after usage passed 216000 gets the compaction signal: ${second.body}`);
+      const error = JSON.parse(second.body).error;
+      assert.equal(error.type, 'request_too_large', name);
+      assert.match(error.message, /Grok context window.*\(216001 tokens > 216000 tokens\)/, name);
+      assert.equal(proxy.received.length, 1, `${name}: the refused turn is not forwarded`);
+    });
+  }
 });

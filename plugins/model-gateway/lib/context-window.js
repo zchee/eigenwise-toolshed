@@ -54,7 +54,9 @@ function saveContextWindowUpdate(saved, update) {
 function gatewayCompactionNote(cap, compactAt, policy, env) {
   if (compactAt === null) return cap ? `compacts past ${gatewayCompactTrigger(cap, null)}` : null;
   const sentry = effectiveSentryPolicy(policy, Number(env.CODEX_GATEWAY_COMPACT_TRIGGER), cap, compactAt);
-  return `requested compact-at ${compactAt}; backend window ${sentry.backendWindow}; effective maximum ${sentry.compactTrigger} (${sentry.source}); compacts past ${sentry.compactTrigger}`;
+  // Rows of one backend can differ (Grok 4.7 is 256k, 4.5 and 4.6 are 500k), so name the row these numbers describe.
+  const row = policy?.backendId && policy.backendId !== 'default' ? ` (${policy.backendId})` : '';
+  return `requested compact-at ${compactAt}; backend window ${sentry.backendWindow}${row}; effective maximum ${sentry.compactTrigger} (${sentry.source}); compacts past ${sentry.compactTrigger}`;
 }
 
 function ignoredCompactTriggerNote(compactAt, env) {

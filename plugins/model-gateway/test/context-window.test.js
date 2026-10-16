@@ -239,6 +239,11 @@ test('window policy marks measured rows and advertises unmeasured Codex defaults
   assert.equal(astraUltrafast.pickerAlias, 'claude-gpt-6-astra-ultrafast[1m]');
   assert.equal(astraUltrafast.transport, 'proxy');
   assert.match(resolveGatewayModelPolicy('claude-gpt-6.1-sol-fast[1m]').measurement, /^measured 2026-09-30/);
+  const solUltrafast = resolveGatewayModelPolicy('claude-gpt-6.1-sol-ultrafast[1m]');
+  assert.equal(solUltrafast.measurement, MODEL_WINDOW_POLICY['gpt-6.1-sol'].measurement);
+  assert.equal(solUltrafast.backendWindow, MODEL_WINDOW_POLICY['gpt-6.1-sol'].backendWindow);
+  assert.equal(solUltrafast.pickerAlias, 'claude-gpt-6.1-sol-ultrafast[1m]');
+  assert.equal(solUltrafast.transport, 'proxy');
 });
 
 test('Codex sentry derives a headroom-preserving trigger for each policy row', () => {

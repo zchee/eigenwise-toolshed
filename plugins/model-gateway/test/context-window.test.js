@@ -210,7 +210,7 @@ test('Codex discovery advertises client 1M aliases and forwards backend base ids
 
 test('window policy marks measured rows and advertises unmeasured Codex defaults', () => {
   const { gatewayModel } = require(WORKER);
-  const { MODEL_WINDOW_POLICY, gatewayClientModelId, resolveGatewayModelPolicy } = require(RUNTIME);
+  const { MODEL_WINDOW_POLICY, contextWindowCap, gatewayClientModelId, resolveGatewayModelPolicy } = require(RUNTIME);
 
   for (const policy of Object.values(MODEL_WINDOW_POLICY)) {
     if (policy.backendId === 'default') continue;
@@ -259,6 +259,26 @@ test('window policy marks measured rows and advertises unmeasured Codex defaults
   assert.equal(solUltrafast.backendWindow, MODEL_WINDOW_POLICY['gpt-6.1-sol'].backendWindow);
   assert.equal(solUltrafast.pickerAlias, 'claude-gpt-6.1-sol-ultrafast[1m]');
   assert.equal(solUltrafast.transport, 'proxy');
+  const museIds = ['muse-spark-1.3', 'muse-spark-1.2', 'muse-wonder-1.0', 'muse-wonder-full-1.0', 'muse-ember-1.0'];
+  const museRow = MODEL_WINDOW_POLICY['muse-spark-1.3'];
+  assert.equal(museRow.backendWindow, 1007997);
+  for (const backendId of museIds) {
+    const muse = resolveGatewayModelPolicy(`claude-${backendId}[1m]`);
+    assert.equal(muse.transport, 'proxy', `${backendId}: only claude-code-proxy serves Muse`);
+    assert.equal(muse.backend, 'muse', backendId);
+    assert.equal(muse.backendId, backendId, backendId);
+    assert.equal(muse.backendWindow, museRow.backendWindow, `${backendId}: every Muse model shares one window`);
+    assert.equal(muse.measurement, museRow.measurement, backendId);
+    assert.equal(muse.pickerAlias, `claude-${backendId}[1m]`, backendId);
+    assert.equal(muse.sentry, 'synthetic-413', backendId);
+    assert.equal(gatewayClientModelId(backendId), `claude-${backendId}[1m]`, `${backendId}: a window above 200k takes the [1m] alias`);
+    assert.equal(gatewayModel(backendId, 'muse').max_input_tokens, 1000000, `${backendId}: advertised at the [1m] client window`);
+    assert.ok(gatewayModel(backendId, 'muse').max_input_tokens < muse.backendWindow, `${backendId}: advertised below the backend window`);
+  }
+  // No context-window setting covers Muse, so a saved Codex or Grok cap never shrinks a Muse row.
+  assert.equal(contextWindowCap('muse', { codex: { value: 100000 }, grok: { value: 100000 } }), null);
+  // OpenCode Go registers the -contributor variants under its own key; they are not Muse rows.
+  assert.equal(Object.hasOwn(MODEL_WINDOW_POLICY, 'muse-spark-1.3-contributor'), false);
 });
 
 test('Codex sentry derives a headroom-preserving trigger for each policy row', () => {
@@ -1646,6 +1666,10 @@ test('doctor policy table includes gateway and native model rows', () => {
   assert.equal(rows.some((row) => row.backendId === 'grok-4.7-fast' || row.backendId === 'grok-4.7-build-fast'), false);
   const liveRows = modelWindowPolicyRows(['grok-4.7-fast']);
   assert.equal(liveRows.some((row) => row.backendId === 'grok-4.7-fast' && row.pickerId === 'claude-grok-4.7-fast[1m]'), true);
+  // Muse rows are proxy-only too: expected only when a live listing carries them.
+  assert.equal(rows.some((row) => row.backendId.startsWith('muse-')), false);
+  const liveMuseRows = modelWindowPolicyRows(['muse-spark-1.3']);
+  assert.equal(liveMuseRows.some((row) => row.backendId === 'muse-spark-1.3' && row.pickerId === 'claude-muse-spark-1.3[1m]'), true);
 
   // Hardcoding the alias ids here read the developer's own ~/.claude detected-pin cache: a machine that
   // had probed its CLI resolved fable to claude-fable-5 while the shipped constant says claude-fable-5-1,

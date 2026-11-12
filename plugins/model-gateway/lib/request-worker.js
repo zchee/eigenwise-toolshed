@@ -1232,7 +1232,7 @@ function runWorker() {
     if (isCompactionRequest(JSON.parse(Buffer.concat(requestChunks).toString()))) return false;
     const crossing = crossedContextSentry(sessionId, model);
     if (!crossing) return false;
-    const backendName = resolveGatewayModelPolicy(model)?.backend === 'grok' ? 'Grok' : 'Codex';
+    const backendName = providerLabel(resolveGatewayModelPolicy(model).backend);
     const overflow = contextOverflowDetails(Buffer.concat(requestChunks), 'gateway_sentry', crossing.usage, 'previous_turn_usage', crossing.compactTrigger);
     routeTelemetry.setOverflow(overflow);
     const body = contextOverflowBody(

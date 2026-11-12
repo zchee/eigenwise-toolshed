@@ -16,6 +16,7 @@ const PROVIDER_LABELS = Object.freeze({
   cursor: 'Cursor',
   grok: 'Grok',
   kimi: 'Kimi',
+  muse: 'Muse',
   opencode: 'OpenCode',
 });
 

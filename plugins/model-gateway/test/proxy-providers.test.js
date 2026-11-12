@@ -8,7 +8,9 @@ const test = require('node:test');
 const { gatewayTestEnvironment, startGateway } = require('./support.js');
 
 // The provider-tagged listing claude-code-proxy 0.1.42 serves, trimmed to one or two rows per
-// provider, with the Anthropic-style aliases it lists under its alias provider left in.
+// provider, with the Anthropic-style aliases it lists under its alias provider left in. The muse
+// rows come from the proxy's dev branch, which lists them after Grok; OpenCode Go registers the
+// -contributor variant of a Muse id as its own model.
 const PROXY_LISTING = [
   ['claude-opus-5-5', 'codex'],
   ['haiku', 'codex'],
@@ -21,8 +23,11 @@ const PROXY_LISTING = [
   ['grok-4.7-build-fast', 'grok'],
   ['grok-4.7-fast', 'grok'],
   ['grok-composer-2.5-fast', 'grok'],
+  ['muse-spark-1.3', 'muse'],
+  ['muse-spark-1.2', 'muse'],
   ['kimi-k3', 'kimi'],
   ['glm-5.3', 'opencode'],
+  ['muse-spark-1.3-contributor', 'opencode'],
   ['opencode-go/kimi-k2.6', 'opencode'],
 ].map(([id, provider]) => ({ type: 'model', object: 'model', id, display_name: `${id} (${provider})` }));
 
@@ -140,8 +145,11 @@ test('the shim advertises every proxy provider row and none of its Claude aliase
     { id: 'claude-grok-4.7-build-fast[1m]', display_name: 'Grok 4.7 build fast', type: 'model', max_input_tokens: 500000 },
     { id: 'claude-grok-4.7-fast[1m]', display_name: 'Grok 4.7 fast', type: 'model', max_input_tokens: 500000 },
     { id: 'claude-grok-composer-2.5-fast', display_name: 'Grok composer 2.5 fast', type: 'model', max_input_tokens: 200000 },
+    { id: 'claude-muse-spark-1.3[1m]', display_name: 'muse-spark-1.3 (Muse)', type: 'model', max_input_tokens: 1000000 },
+    { id: 'claude-muse-spark-1.2[1m]', display_name: 'muse-spark-1.2 (Muse)', type: 'model', max_input_tokens: 1000000 },
     { id: 'claude-kimi-k3', display_name: 'kimi-k3 (Kimi)', type: 'model', max_input_tokens: 200000 },
     { id: 'claude-glm-5.3', display_name: 'glm-5.3 (OpenCode)', type: 'model', max_input_tokens: 200000 },
+    { id: 'claude-muse-spark-1.3-contributor', display_name: 'muse-spark-1.3-contributor (OpenCode)', type: 'model', max_input_tokens: 200000 },
     { id: 'claude-opencode-go/kimi-k2.6', display_name: 'opencode-go/kimi-k2.6 (OpenCode)', type: 'model', max_input_tokens: 200000 },
   ]);
 });
@@ -160,6 +168,8 @@ test('non-Codex rows reach the proxy under their backend id with credentials and
     'Grok row only the proxy serves': { model: 'claude-grok-composer-2.5-fast', backend: 'grok-composer-2.5-fast' },
     'Grok 4.7 Fast alias the proxy resolves upstream': { model: 'claude-grok-4.7-fast[1m]', backend: 'grok-4.7-fast' },
     'Grok 4.7 Fast under its backend id': { model: 'claude-grok-4.7-build-fast[1m]', backend: 'grok-4.7-build-fast' },
+    'Muse row': { model: 'claude-muse-spark-1.3[1m]', backend: 'muse-spark-1.3' },
+    'OpenCode row named after a Muse model': { model: 'claude-muse-spark-1.3-contributor', backend: 'muse-spark-1.3-contributor' },
   };
 
   for (const [name, { model, backend }] of Object.entries(tests)) {
@@ -244,6 +254,9 @@ test('proxy provider auth state follows the proxy CLI exit code, and OpenCode fo
     'success: signed in': { provider: 'kimi', run: exitWith(0), expected: 'ready' },
     'error: signed out': { provider: 'cursor', run: exitWith(1), expected: 'auth-missing' },
     'error: status unavailable': { provider: 'kimi', run: exitWith(2), expected: 'auth-unknown' },
+    'success: Muse signed in': { provider: 'muse', run: exitWith(0), expected: 'ready' },
+    'error: Muse login refused, a new login is the fix': { provider: 'muse', run: exitWith(1), expected: 'auth-missing' },
+    'error: Muse key service unavailable': { provider: 'muse', run: exitWith(2), expected: 'auth-unknown' },
     'success: OpenCode key in the proxy env var': { provider: 'opencode', env: { CCP_OPENCODE_API_KEY: 'k' }, expected: 'ready' },
     'success: OpenCode key in the OpenCode env var': { provider: 'opencode', env: { OPENCODE_API_KEY: 'k' }, expected: 'ready' },
     'error: OpenCode without a key': { provider: 'opencode', env: {}, expected: 'auth-missing' },
@@ -251,7 +264,10 @@ test('proxy provider auth state follows the proxy CLI exit code, and OpenCode fo
   for (const [name, { provider, run = exitWith(99), env = {}, expected }] of Object.entries(tests)) {
     assert.equal(proxyProviderAuthState(provider, { run, env, configDirectory }), expected, name);
   }
-  assert.deepEqual(calls, [['kimi', 'auth', 'status'], ['cursor', 'auth', 'status'], ['kimi', 'auth', 'status']]);
+  assert.deepEqual(calls, [
+    ['kimi', 'auth', 'status'], ['cursor', 'auth', 'status'], ['kimi', 'auth', 'status'],
+    ['muse', 'auth', 'status'], ['muse', 'auth', 'status'], ['muse', 'auth', 'status'],
+  ]);
 
   fs.writeFileSync(path.join(configDirectory, 'config.json'), JSON.stringify({ opencode: { apiKey: 'from-config' } }));
   assert.equal(proxyProviderAuthState('opencode', { env: {}, configDirectory }), 'ready');
@@ -277,6 +293,8 @@ test('proxy provider readiness reuses shared proxy checks before asking about si
     assert.equal(readiness.ready, state === 'ready', name);
     assert.match(readiness.message, message, name);
   }
+  const muse = getProxyProviderReadiness('muse', { checks: healthy }, { authState: () => 'auth-missing' });
+  assert.match(muse.message, /has no Muse sign-in\. Run `".*" muse auth login`\./);
   const opencode = getProxyProviderReadiness('opencode', { checks: healthy }, { authState: () => 'auth-missing' });
   assert.match(opencode.message, /OpenCode Go needs an API key: set CCP_OPENCODE_API_KEY or OPENCODE_API_KEY/);
 });
@@ -302,6 +320,7 @@ test('the Sidequest catalog lists every proxy provider under its own slug and re
     'claude-opencode-go/kimi-k2.6',
     'claude-cursor-agent',
     'claude-grok-composer-2.5-fast',
+    'claude-muse-spark-1.3[1m]',
     'claude-opus-5-5',
   ], codexReadiness);
 
@@ -316,8 +335,9 @@ test('the Sidequest catalog lists every proxy provider under its own slug and re
     { slug: 'opencode-go-kimi-k2-6', id: 'claude-opencode-go/kimi-k2.6', label: 'opencode-go/kimi-k2.6 (OpenCode)', provider: 'opencode' },
     { slug: 'cursor-agent', id: 'claude-cursor-agent', label: 'cursor-agent (Cursor)', provider: 'cursor' },
     { slug: 'grok-composer-2-5-fast', id: 'claude-grok-composer-2.5-fast', label: 'Grok composer 2.5 fast', provider: 'grok' },
+    { slug: 'muse-spark-1-3', id: 'claude-muse-spark-1.3[1m]', label: 'muse-spark-1.3 (Muse)', provider: 'muse' },
   ]);
-  for (const provider of ['kimi', 'opencode', 'cursor']) {
+  for (const provider of ['kimi', 'opencode', 'cursor', 'muse']) {
     assert.equal(catalog.providers[provider].state, 'binary-missing', provider);
     assert.equal(catalog.providers[provider].ready, false, provider);
   }
@@ -395,4 +415,28 @@ test('Grok 4.7 Fast rows reach the proxy and compact 40000 below their 500000 wi
       assert.equal(proxy.received.length, 1, `${name}: the refused turn is not forwarded`);
     });
   }
+});
+
+test('Muse rows reach the proxy and compact 40000 below their 1007997 window', async (t) => {
+  const proxy = await listingProxy(t, (body, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: {}, usage: { input_tokens: 967998, output_tokens: 1 } })}\n\n`
+      + 'event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  });
+  const anthropic = await anthropicUpstream(t);
+  const { port } = await spawnShim(t, proxy.port, anthropic.url);
+  const session = { 'x-claude-code-session-id': 'muse-sentry' };
+
+  const first = await request(port, 'POST', '/v1/messages', messageBody('claude-muse-spark-1.3[1m]'), session);
+  assert.equal(first.status, 200, first.body);
+  assert.equal(proxy.received.length, 1, 'the first turn reaches the proxy');
+  assert.equal(proxy.received[0].body.model, 'muse-spark-1.3', 'the proxy gets the un-prefixed Muse id');
+  assert.equal(anthropic.received.length, 0, 'nothing reaches api.anthropic.com');
+
+  const second = await request(port, 'POST', '/v1/messages', messageBody('claude-muse-spark-1.3[1m]'), session);
+  assert.equal(second.status, 413, `the turn after usage passed 967997 gets the compaction signal: ${second.body}`);
+  const { error } = JSON.parse(second.body);
+  assert.equal(error.type, 'request_too_large');
+  assert.match(error.message, /^Prompt is too long for the Muse context window; compact and retry\. \(967998 tokens > 967997 tokens\)/);
+  assert.equal(proxy.received.length, 1, 'the refused turn is not forwarded');
 });

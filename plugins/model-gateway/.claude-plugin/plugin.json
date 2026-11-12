@@ -1,7 +1,7 @@
 {
   "name": "model-gateway",
   "version": "0.56.3",
-  "description": "Your ChatGPT/Codex, Grok, Kimi, Cursor, and OpenCode Go models in Claude Code's /model picker. A local gateway sends every model claude-code-proxy serves (claude-gpt-*, claude-kimi-*, claude-glm-*, and the rest of its list) through that proxy, measured claude-grok-* models to Grok, and everything else to api.anthropic.com, so you switch between Claude and those models mid-session like any other model.",
+  "description": "Your ChatGPT/Codex, Grok, Kimi, Cursor, Muse, and OpenCode Go models in Claude Code's /model picker. A local gateway sends every model claude-code-proxy serves (claude-gpt-*, claude-kimi-*, claude-muse-*, claude-glm-*, and the rest of its list) through that proxy, measured claude-grok-* models to Grok, and everything else to api.anthropic.com, so you switch between Claude and those models mid-session like any other model.",
   "author": {
     "name": "Eigenwise",
     "email": "kenny@eigenwise.io"
@@ -18,6 +18,7 @@
     "grok",
     "kimi",
     "cursor",
+    "muse",
     "opencode",
     "model-picker",
     "gateway",

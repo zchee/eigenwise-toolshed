@@ -153,6 +153,21 @@ const MODEL_WINDOW_POLICY = Object.freeze({
     advertisedWindow: 500000,
     sentry: 'synthetic-413',
   }),
+  // Meta's Muse Code models, served only by claude-code-proxy's muse provider. All five share one
+  // window, so they are one row shape. They advertise the [1m] alias's 1000000 client window, which
+  // stays under the backend's 1007997. transport is explicit so a request is forwarded to the proxy
+  // and doctor does not expect these rows when no live listing proves the proxy serves them.
+  ...Object.fromEntries(['muse-spark-1.3', 'muse-spark-1.2', 'muse-wonder-1.0', 'muse-wonder-full-1.0', 'muse-ember-1.0']
+    .map((backendId) => [backendId, Object.freeze({
+      backend: 'muse',
+      transport: 'proxy',
+      backendId,
+      backendWindow: 1007997,
+      measurement: 'claude-code-proxy dev 1b2e80b 2026-11-10 docs/providers/muse.md (context 1007997, max output 128000 for every Muse model); not a live probe',
+      pickerAlias: `claude-${backendId}[1m]`,
+      advertisedWindow: 1000000,
+      sentry: 'synthetic-413',
+    })])),
   anthropic: Object.freeze({
     backend: 'anthropic',
     backendId: 'anthropic',

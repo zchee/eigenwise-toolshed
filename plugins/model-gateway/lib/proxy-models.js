@@ -18,6 +18,7 @@ const PROVIDER_LABELS = Object.freeze({
   kimi: 'Kimi',
   muse: 'Muse',
   opencode: 'OpenCode',
+  vertex: 'Vertex AI',
 });
 
 function providerLabel(provider) {
@@ -72,6 +73,16 @@ function proxyModelRoutes() {
   return [...proxyRoutes].map(([id, provider]) => ({ id, provider }));
 }
 
+// claude-code-proxy's vertex provider lists each Gemini model twice, under its bare id and as
+// vertex/<id>, and sends both to the same upstream model. Only the bare row is advertised; the
+// vertex/ spelling stays in the route table, so it still routes when a user types it.
+const VERTEX_ID_PREFIX = 'vertex/';
+
+function advertisedProxyRoutes(routes) {
+  const vertexIds = new Set(routes.filter(({ provider }) => provider === 'vertex').map(({ id }) => id));
+  return routes.filter(({ id, provider }) => !(provider === 'vertex' && id.startsWith(VERTEX_ID_PREFIX) && vertexIds.has(id.slice(VERTEX_ID_PREFIX.length))));
+}
+
 // Codex ids stay routable with no listing at all, as they were before listings were read.
 function proxyModelProvider(backendId) {
   if (typeof backendId !== 'string' || !backendId) return null;
@@ -86,6 +97,7 @@ function proxyModelDisplayName(id, provider) {
 module.exports = {
   ANTHROPIC_STYLE_ALIAS_RE,
   CODEX_FAMILY_RE,
+  advertisedProxyRoutes,
   modelsFileRoutes,
   parseProxyModelListing,
   providerLabel,

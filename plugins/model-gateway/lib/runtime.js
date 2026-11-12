@@ -48,6 +48,56 @@ const HOSTS_BLOCK_START = '# >>> model-gateway RC compatibility >>>';
 const HOSTS_BLOCK_END = '# <<< model-gateway RC compatibility <<<';
 const HOSTS_BLOCK_LINE = `127.0.0.1 ${COMPAT_HOST}`;
 const CODEX_UNKNOWN_MODEL_WINDOW = 200000;
+// The [1m] picker alias gives Claude Code a 1000000-token client window, so a row whose backend
+// takes more still advertises 1000000.
+const PICKER_ALIAS_CLIENT_WINDOW = 1000000;
+
+// Google Cloud Vertex AI models, served only by claude-code-proxy's vertex provider. The proxy
+// lists each Gemini model under its bare id and again as vertex/<id>; every other family is
+// vertex/<publisher>/<id>. A registered model has a row only when a source documents a window above
+// Claude Code's 200000 unknown-model window. Mistral, gpt-oss, Grok 4.3 and the two dated Claude
+// ids are documented at or below it, DeepSeek has no documented window, and a deployed endpoint
+// (vertex/endpoint/<name>) serves whatever its owner deployed, so all of those stay unmeasured
+// 200000 rows. transport is explicit so a request is forwarded to the proxy and doctor does not
+// expect these rows when no live listing proves the proxy serves them.
+const VERTEX_GEMINI_IDS = Object.freeze([
+  'gemini-4-argon', 'gemini-4-carbon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash',
+  'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview',
+]);
+const VERTEX_WINDOW_EVIDENCE = Object.freeze([
+  ['models.dev google-vertex 2026-11-12', [
+    [1048576, VERTEX_GEMINI_IDS.flatMap((id) => [id, `vertex/${id}`])],
+    [1000000, [
+      'claude-fable-5-2', 'claude-fable-5-1', 'claude-fable-5', 'claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-8',
+      'claude-opus-4-7', 'claude-sonnet-5-5', 'claude-sonnet-5', 'claude-haiku-5-5', 'claude-opus-4-6', 'claude-sonnet-4-6',
+    ].map((id) => `vertex/anthropic/${id}`)],
+    [524288, ['vertex/xai/grok-4.7', 'vertex/xai/grok-4.6']],
+    [2000000, ['vertex/xai/grok-4.20-reasoning', 'vertex/xai/grok-4.20-non-reasoning']],
+    [1000000, ['vertex/zai-org/glm-5.2-maas']],
+    [262144, ['vertex/google/gemma-4-26b-a4b-it-maas']],
+    [524288, ['vertex/meta/llama-4-maverick-17b-128e-instruct-maas']],
+    [1310720, ['vertex/meta/llama-4-scout-17b-16e-instruct-maas']],
+  ]],
+  ['claude-code-proxy dev c31326c 2026-11-12 docs/providers/vertex.md, quoting Google\'s input limit', [
+    [922000, ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-luna'].map((id) => `vertex/openai/${id}`)],
+    [1048576, ['muse-spark-1.3', 'muse-wonder-1.0', 'muse-ember-1.0'].map((id) => `vertex/meta/${id}`)],
+  ]],
+]);
+
+function vertexWindowPolicyRows() {
+  return Object.fromEntries(VERTEX_WINDOW_EVIDENCE.flatMap(([source, windows]) => windows.flatMap(([backendWindow, backendIds]) => backendIds
+    .map((backendId) => [backendId, Object.freeze({
+      backend: 'vertex',
+      transport: 'proxy',
+      backendId,
+      backendWindow,
+      measurement: `${source} (context ${backendWindow}); not a live probe`,
+      pickerAlias: `claude-${backendId}[1m]`,
+      advertisedWindow: Math.min(backendWindow, PICKER_ALIAS_CLIENT_WINDOW),
+      sentry: 'synthetic-413',
+    })]))));
+}
+
 const MODEL_WINDOW_POLICY = Object.freeze({
   default: Object.freeze({
     backend: 'codex',
@@ -168,6 +218,7 @@ const MODEL_WINDOW_POLICY = Object.freeze({
       advertisedWindow: 1000000,
       sentry: 'synthetic-413',
     })])),
+  ...vertexWindowPolicyRows(),
   anthropic: Object.freeze({
     backend: 'anthropic',
     backendId: 'anthropic',

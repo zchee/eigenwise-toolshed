@@ -1406,11 +1406,7 @@ async function doctor({ readiness: suppliedReadiness = null } = {}) {
   if (readiness.checks.proxyBinary && await loadProxyModelRoutes()) {
     const providers = [...new Set(proxyModelRoutes().map((route) => route.provider))].filter((provider) => provider !== 'codex');
     for (const provider of providers) {
-      const state = proxyProviderAuthState(provider);
-      const described = state === 'ready' ? (provider === 'opencode' ? 'API key present' : 'authenticated')
-        : state === 'auth-missing' ? `MISSING (${PROXY_PROVIDER_READINESS_REASONS[state](provider, providerLabel(provider))})`
-          : 'status unavailable';
-      log(`proxy ${provider} auth: ${described}`);
+      log(`proxy ${provider} auth: ${describeProxyProviderAuth(provider, proxyProviderAuthState(provider))}`);
     }
   }
   const status = await statusReport({ readiness });
@@ -1573,7 +1569,9 @@ const CATALOG_SCHEMA_VERSION = 4;
 // so the slug stays unique without depending on iteration order.
 function slugFor(provider, base, used) {
   const providerPrefix = `${provider}-`;
-  const providerBase = base.startsWith(providerPrefix) ? base.slice(providerPrefix.length) : base;
+  // A base that already starts with its provider does not repeat it, whether the provider is joined
+  // by `-` or is the `<provider>/` namespace the vertex provider puts in front of its ids.
+  const providerBase = base.startsWith(providerPrefix) || base.startsWith(`${provider}/`) ? base.slice(providerPrefix.length) : base;
   let s = (providerPrefix + providerBase).toLowerCase()
     .replace(/\[1m\]$/, '')
     .replace(/\./g, '-')
@@ -1659,28 +1657,64 @@ function proxyConfigDirectory({ env = process.env, platform = process.platform, 
 
 // `claude-code-proxy <provider> auth status` exits 0 when signed in and 1 when not. OpenCode Go
 // has no auth subcommand: the proxy reads an API key from its environment or config.json, so only
-// its presence can be checked, and only in this process's environment.
+// its presence can be checked, and only in this process's environment. Vertex AI has no sign-in of
+// its own either: the proxy uses Google Application Default Credentials, and its status exits 2
+// when a Vertex setting is missing or invalid, which is what a machine that never set a project
+// reports. Like the OpenCode key, that status describes this process's environment.
+//
+// The status asks Google for a token before it looks at its settings, and without a credentials
+// file that waits on a metadata server that exists only on Google Cloud. With no project it exits
+// 2 whatever the token attempt returned, so that answer is given here without starting a process.
+// The sources and the blank rule mirror claude-code-proxy's config::resolve_vertex_config.
+function vertexProjectIsSet(env, configDirectory) {
+  const isSet = (value) => typeof value === 'string' && value.trim() !== '';
+  return isSet(env.CCP_VERTEX_PROJECT) || isSet(env.GOOGLE_CLOUD_PROJECT)
+    || isSet(readJsonFile(path.join(configDirectory, 'config.json'))?.vertex?.project);
+}
+
 function proxyProviderAuthState(provider, { run = spawnSync, env = process.env, configDirectory = proxyConfigDirectory() } = {}) {
   if (provider === 'opencode') {
     if (env.CCP_OPENCODE_API_KEY || env.OPENCODE_API_KEY) return 'ready';
     const apiKey = readJsonFile(path.join(configDirectory, 'config.json'))?.opencode?.apiKey;
     return typeof apiKey === 'string' && apiKey ? 'ready' : 'auth-missing';
   }
+  if (provider === 'vertex' && !vertexProjectIsSet(env, configDirectory)) return 'config-invalid';
   const result = run(PROXY_BIN, [provider, 'auth', 'status'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
   if (result.status === 0) return 'ready';
-  return result.status === 1 ? 'auth-missing' : 'auth-unknown';
+  if (result.status === 1) return 'auth-missing';
+  return provider === 'vertex' && result.status === 2 ? 'config-invalid' : 'auth-unknown';
 }
+
+// Providers the proxy signs in to itself take `<provider> auth login`; these two do not.
+const PROXY_PROVIDER_CREDENTIAL_FIXES = {
+  opencode: () => `OpenCode Go needs an API key: set CCP_OPENCODE_API_KEY or OPENCODE_API_KEY where the gateway starts, or opencode.apiKey in ${path.join(proxyConfigDirectory(), 'config.json')}.`,
+  vertex: () => `claude-code-proxy got no Google access token for Vertex AI: Application Default Credentials are missing or expired, or Google could not be reached. Run \`gcloud auth application-default login\`, or set GOOGLE_APPLICATION_CREDENTIALS to a credentials file where the gateway starts; \`"${PROXY_BIN}" vertex auth status\` prints the reason.`,
+};
 
 const PROXY_PROVIDER_READINESS_REASONS = {
   'binary-missing': () => `claude-code-proxy is missing. Run \`node "${resolveStableCommandPath()}" setup\`.`,
   'proxy-down': () => 'claude-code-proxy is not answering on /v1/models.',
   'shim-down': () => 'the model-gateway shim is down.',
   'serving-version-mismatch': () => 'model-gateway is serving a stale shim version.',
-  'auth-missing': (provider, label) => (provider === 'opencode'
-    ? `OpenCode Go needs an API key: set CCP_OPENCODE_API_KEY or OPENCODE_API_KEY where the gateway starts, or opencode.apiKey in ${path.join(proxyConfigDirectory(), 'config.json')}.`
-    : `claude-code-proxy has no ${label} sign-in. Run \`"${PROXY_BIN}" ${provider} auth login\`.`),
+  'auth-missing': (provider, label) => PROXY_PROVIDER_CREDENTIAL_FIXES[provider]?.()
+    ?? `claude-code-proxy has no ${label} sign-in. Run \`"${PROXY_BIN}" ${provider} auth login\`.`,
   'auth-unknown': (provider, label) => `claude-code-proxy could not report ${label} sign-in status.`,
+  'config-invalid': (provider, label) => `claude-code-proxy reports a missing or invalid ${label} setting, most often an unset Google Cloud project: set vertex.project in ${path.join(proxyConfigDirectory(), 'config.json')}, or CCP_VERTEX_PROJECT or GOOGLE_CLOUD_PROJECT where the gateway starts. Run \`"${PROXY_BIN}" ${provider} auth status\` to see which setting.`,
 };
+
+// What a provider's `ready` state proved about its credentials.
+function proxyProviderCredentialCheck(provider) {
+  if (provider === 'opencode') return 'API key presence';
+  return provider === 'vertex' ? 'Google credentials and Vertex settings' : 'authentication';
+}
+
+// The `proxy <provider> auth:` value doctor prints for a provider's auth state.
+function describeProxyProviderAuth(provider, state) {
+  if (state === 'ready') return provider === 'opencode' ? 'API key present' : 'authenticated';
+  const reason = PROXY_PROVIDER_READINESS_REASONS[state]?.(provider, providerLabel(provider));
+  if (state === 'auth-missing') return `MISSING (${reason})`;
+  return state === 'config-invalid' ? `NOT CONFIGURED (${reason})` : 'status unavailable';
+}
 
 // Codex readiness already probed the binary, /v1/models, the shim, and its version, which every
 // proxy provider shares; only the provider's own sign-in is checked again here.
@@ -1696,7 +1730,7 @@ function getProxyProviderReadiness(provider, codexReadiness, { authState = proxy
     ready: state === 'ready',
     state,
     message: state === 'ready'
-      ? `${label} readiness confirms local binary, /v1/models, ${provider === 'opencode' ? 'API key presence' : 'authentication'}, shim, and serving-version checks. It does not prove a streaming request will succeed.`
+      ? `${label} readiness confirms local binary, /v1/models, ${proxyProviderCredentialCheck(provider)}, shim, and serving-version checks. It does not prove a streaming request will succeed.`
       : PROXY_PROVIDER_READINESS_REASONS[state](provider, label),
   };
 }
@@ -2937,6 +2971,7 @@ module.exports = {
   getCodexReadiness,
   catalogReadiness,
   getGrokReadiness,
+  describeProxyProviderAuth,
   getProxyProviderReadiness,
   proxyConfigDirectory,
   proxyProviderAuthState,

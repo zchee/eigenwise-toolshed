@@ -20,7 +20,7 @@ const { effectiveBaseUrl, wiredMode } = require('./settings-wiring.js');
 const { detectHostsCompat } = require('./remote-control.js');
 const { ourBaseUrls, proxyRouteFromId } = require('./pins.js');
 const {
-  modelsFileRoutes, parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes, setProxyModelRoutes,
+  advertisedProxyRoutes, modelsFileRoutes, parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes, setProxyModelRoutes,
 } = require('./proxy-models.js');
 const { createAnthropicCatalog, advertisedAnthropicRows, withCachedAnthropicRows } = require('./anthropic-catalog.js');
 const { withPreviousServerRows } = require('./previous-picker-rows.js');
@@ -1355,7 +1355,7 @@ function runWorker() {
     }
     routes = proxyModelRoutes();
     // Rows this plugin's Grok backend serves are listed from the Grok CLI below, not from the proxy.
-    const proxyRows = routes.filter(({ id }) => resolveGatewayModelPolicy(id)?.transport === 'proxy');
+    const proxyRows = advertisedProxyRoutes(routes).filter(({ id }) => resolveGatewayModelPolicy(id)?.transport === 'proxy');
     const grokModels = grokBackend.grokModelsFromCache();
     const advertisedGrokModels = grokModels.length ? grokModels : DEFAULT_GROK_MODELS;
     modelCache = {

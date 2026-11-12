@@ -10,7 +10,9 @@ const { gatewayTestEnvironment, startGateway } = require('./support.js');
 // The provider-tagged listing claude-code-proxy 0.1.42 serves, trimmed to one or two rows per
 // provider, with the Anthropic-style aliases it lists under its alias provider left in. The muse
 // rows come from the proxy's dev branch, which lists them after Grok; OpenCode Go registers the
-// -contributor variant of a Muse id as its own model.
+// -contributor variant of a Muse id as its own model. The vertex rows come from the dev branch
+// too: a Gemini model under its bare id and again as vertex/<id>, partner models as
+// vertex/<publisher>/<id>, and a deployed endpoint from the proxy's own config.json.
 const PROXY_LISTING = [
   ['claude-opus-5-5', 'codex'],
   ['haiku', 'codex'],
@@ -29,6 +31,11 @@ const PROXY_LISTING = [
   ['glm-5.3', 'opencode'],
   ['muse-spark-1.3-contributor', 'opencode'],
   ['opencode-go/kimi-k2.6', 'opencode'],
+  ['gemini-4-argon', 'vertex'],
+  ['vertex/anthropic/claude-opus-5-5', 'vertex'],
+  ['vertex/endpoint/my-llm', 'vertex'],
+  ['vertex/gemini-4-argon', 'vertex'],
+  ['vertex/mistralai/codestral-2', 'vertex'],
 ].map(([id, provider]) => ({ type: 'model', object: 'model', id, display_name: `${id} (${provider})` }));
 
 function listen(server) {
@@ -151,7 +158,42 @@ test('the shim advertises every proxy provider row and none of its Claude aliase
     { id: 'claude-glm-5.3', display_name: 'glm-5.3 (OpenCode)', type: 'model', max_input_tokens: 200000 },
     { id: 'claude-muse-spark-1.3-contributor', display_name: 'muse-spark-1.3-contributor (OpenCode)', type: 'model', max_input_tokens: 200000 },
     { id: 'claude-opencode-go/kimi-k2.6', display_name: 'opencode-go/kimi-k2.6 (OpenCode)', type: 'model', max_input_tokens: 200000 },
+    { id: 'claude-gemini-4-argon[1m]', display_name: 'gemini-4-argon (Vertex AI)', type: 'model', max_input_tokens: 1000000 },
+    // A Claude model on Vertex AI is a proxy row: the Anthropic-style alias filter reads the
+    // proxy's id, which starts with vertex/, not claude-.
+    { id: 'claude-vertex/anthropic/claude-opus-5-5[1m]', display_name: 'vertex/anthropic/claude-opus-5-5 (Vertex AI)', type: 'model', max_input_tokens: 1000000 },
+    { id: 'claude-vertex/endpoint/my-llm', display_name: 'vertex/endpoint/my-llm (Vertex AI)', type: 'model', max_input_tokens: 200000 },
+    { id: 'claude-vertex/mistralai/codestral-2', display_name: 'vertex/mistralai/codestral-2 (Vertex AI)', type: 'model', max_input_tokens: 200000 },
   ]);
+  // The proxy lists vertex/gemini-4-argon beside the bare id; one model gets one picker row.
+  assert.equal(listed.some((model) => model.id.startsWith('claude-vertex/gemini-')), false);
+});
+
+test('only the bare spelling of a Vertex Gemini model is advertised, and only against its own provider', () => {
+  const { advertisedProxyRoutes } = require('../lib/proxy-models.js');
+  const tests = {
+    'success: the vertex/ spelling of a listed Vertex id is dropped': {
+      routes: [['gemini-4-argon', 'vertex'], ['vertex/gemini-4-argon', 'vertex']],
+      expected: ['gemini-4-argon'],
+    },
+    'success: a vertex/ id with no bare twin stays': {
+      routes: [['vertex/gemini-9-neon', 'vertex'], ['vertex/anthropic/claude-opus-5-5', 'vertex'], ['vertex/endpoint/my-llm', 'vertex']],
+      expected: ['vertex/gemini-9-neon', 'vertex/anthropic/claude-opus-5-5', 'vertex/endpoint/my-llm'],
+    },
+    'success: a bare id another provider serves is not the same model': {
+      routes: [['gemini-4-argon', 'gemini'], ['vertex/gemini-4-argon', 'vertex']],
+      expected: ['gemini-4-argon', 'vertex/gemini-4-argon'],
+    },
+    'success: another provider keeps an id that happens to start with vertex/': {
+      routes: [['gemini-4-argon', 'vertex'], ['vertex/gemini-4-argon', 'opencode']],
+      expected: ['gemini-4-argon', 'vertex/gemini-4-argon'],
+    },
+    'success: an empty listing': { routes: [], expected: [] },
+  };
+  for (const [name, { routes, expected }] of Object.entries(tests)) {
+    const advertised = advertisedProxyRoutes(routes.map(([id, provider]) => ({ id, provider })));
+    assert.deepEqual(advertised.map(({ id }) => id), expected, name);
+  }
 });
 
 test('non-Codex rows reach the proxy under their backend id with credentials and plan tools removed', async (t) => {
@@ -170,6 +212,11 @@ test('non-Codex rows reach the proxy under their backend id with credentials and
     'Grok 4.7 Fast under its backend id': { model: 'claude-grok-4.7-build-fast[1m]', backend: 'grok-4.7-build-fast' },
     'Muse row': { model: 'claude-muse-spark-1.3[1m]', backend: 'muse-spark-1.3' },
     'OpenCode row named after a Muse model': { model: 'claude-muse-spark-1.3-contributor', backend: 'muse-spark-1.3-contributor' },
+    'Vertex Gemini row under its bare id': { model: 'claude-gemini-4-argon[1m]', backend: 'gemini-4-argon' },
+    'Vertex Gemini spelling that is listed but not advertised': { model: 'claude-vertex/gemini-4-argon[1m]', backend: 'vertex/gemini-4-argon' },
+    'Claude on Vertex goes to the proxy, not to Anthropic, and is filtered like every proxy row': { model: 'claude-vertex/anthropic/claude-opus-5-5[1m]', backend: 'vertex/anthropic/claude-opus-5-5' },
+    'Vertex row without a documented window above 200k': { model: 'claude-vertex/mistralai/codestral-2', backend: 'vertex/mistralai/codestral-2' },
+    'Vertex deployed endpoint': { model: 'claude-vertex/endpoint/my-llm', backend: 'vertex/endpoint/my-llm' },
   };
 
   for (const [name, { model, backend }] of Object.entries(tests)) {
@@ -198,12 +245,14 @@ test('Claude ids and ids the proxy never listed still go to Anthropic', async (t
   const anthropic = await anthropicUpstream(t);
   const { port } = await spawnShim(t, proxy.port, anthropic.url);
 
-  for (const model of ['claude-opus-5-5', 'claude-glm-99']) {
+  // The vertex/ prefix alone proves nothing: only the listing or a policy row makes a proxy route.
+  const models = ['claude-opus-5-5', 'claude-glm-99', 'claude-vertex/ai21/jamba-2'];
+  for (const model of models) {
     const response = await request(port, 'POST', '/v1/messages', messageBody(model));
     assert.equal(response.status, 200, response.body);
   }
 
-  assert.deepEqual(anthropic.received, ['claude-opus-5-5', 'claude-glm-99']);
+  assert.deepEqual(anthropic.received, models);
   assert.deepEqual(proxy.received, []);
 });
 
@@ -257,20 +306,34 @@ test('proxy provider auth state follows the proxy CLI exit code, and OpenCode fo
     'success: Muse signed in': { provider: 'muse', run: exitWith(0), expected: 'ready' },
     'error: Muse login refused, a new login is the fix': { provider: 'muse', run: exitWith(1), expected: 'auth-missing' },
     'error: Muse key service unavailable': { provider: 'muse', run: exitWith(2), expected: 'auth-unknown' },
+    'success: Vertex credentials and settings resolve': { provider: 'vertex', env: { CCP_VERTEX_PROJECT: 'p' }, run: exitWith(0), expected: 'ready' },
+    'error: Vertex without a Google access token': { provider: 'vertex', env: { GOOGLE_CLOUD_PROJECT: ' p ' }, run: exitWith(1), expected: 'auth-missing' },
+    'error: Vertex with a project and another invalid setting': { provider: 'vertex', env: { CCP_VERTEX_PROJECT: 'p' }, run: exitWith(2), expected: 'config-invalid' },
+    'error: Vertex status timed out': { provider: 'vertex', env: { CCP_VERTEX_PROJECT: 'p' }, run: exitWith(null), expected: 'auth-unknown' },
+    // No project is exit 2 whatever the token attempt says, so no status process starts: on a
+    // machine that never set Vertex AI up that process would wait on Google's metadata server.
+    'error: Vertex without a project': { provider: 'vertex', env: {}, run: exitWith(0), expected: 'config-invalid', spawns: false },
+    'error: Vertex with only blank project variables': { provider: 'vertex', env: { CCP_VERTEX_PROJECT: '', GOOGLE_CLOUD_PROJECT: '  ' }, run: exitWith(0), expected: 'config-invalid', spawns: false },
     'success: OpenCode key in the proxy env var': { provider: 'opencode', env: { CCP_OPENCODE_API_KEY: 'k' }, expected: 'ready' },
     'success: OpenCode key in the OpenCode env var': { provider: 'opencode', env: { OPENCODE_API_KEY: 'k' }, expected: 'ready' },
     'error: OpenCode without a key': { provider: 'opencode', env: {}, expected: 'auth-missing' },
   };
-  for (const [name, { provider, run = exitWith(99), env = {}, expected }] of Object.entries(tests)) {
+  for (const [name, { provider, run = exitWith(99), env = {}, expected, spawns = provider !== 'opencode' }] of Object.entries(tests)) {
+    const before = calls.length;
     assert.equal(proxyProviderAuthState(provider, { run, env, configDirectory }), expected, name);
+    assert.equal(calls.length - before, spawns ? 1 : 0, `${name}: status processes started`);
   }
   assert.deepEqual(calls, [
     ['kimi', 'auth', 'status'], ['cursor', 'auth', 'status'], ['kimi', 'auth', 'status'],
     ['muse', 'auth', 'status'], ['muse', 'auth', 'status'], ['muse', 'auth', 'status'],
+    ['vertex', 'auth', 'status'], ['vertex', 'auth', 'status'], ['vertex', 'auth', 'status'], ['vertex', 'auth', 'status'],
   ]);
 
-  fs.writeFileSync(path.join(configDirectory, 'config.json'), JSON.stringify({ opencode: { apiKey: 'from-config' } }));
+  fs.writeFileSync(path.join(configDirectory, 'config.json'), JSON.stringify({ opencode: { apiKey: 'from-config' }, vertex: { project: 'from-config' } }));
   assert.equal(proxyProviderAuthState('opencode', { env: {}, configDirectory }), 'ready');
+  // A project in the proxy's config.json counts like the variables do, so the status is asked.
+  assert.equal(proxyProviderAuthState('vertex', { run: exitWith(0), env: {}, configDirectory }), 'ready');
+  assert.deepEqual(calls.at(-1), ['vertex', 'auth', 'status']);
 
   assert.equal(proxyConfigDirectory({ env: { CCP_CONFIG_DIR: '/custom' }, platform: 'linux', home: '/h' }), '/custom');
   assert.equal(proxyConfigDirectory({ env: {}, platform: 'darwin', home: '/h' }), path.join('/h', '.config', 'claude-code-proxy'));
@@ -299,6 +362,47 @@ test('proxy provider readiness reuses shared proxy checks before asking about si
   assert.match(opencode.message, /OpenCode Go needs an API key: set CCP_OPENCODE_API_KEY or OPENCODE_API_KEY/);
 });
 
+test('Vertex AI readiness names gcloud and the project setting, never a proxy login', () => {
+  const { describeProxyProviderAuth, getProxyProviderReadiness } = require('../lib/commands.js');
+  const healthy = { proxyBinary: true, proxyModels: true, shimRunning: true, servingVersionMatches: true };
+  // `claude-code-proxy vertex auth login` only prints the gcloud hint and exits 2, so no message may send the user to it.
+  const tests = {
+    'success: credentials and settings resolve': {
+      auth: 'ready',
+      message: /^Vertex AI readiness confirms local binary, \/v1\/models, Google credentials and Vertex settings, shim, and serving-version checks\./,
+      doctor: /^authenticated$/,
+    },
+    'error: no Google access token': {
+      auth: 'auth-missing',
+      message: /^claude-code-proxy got no Google access token for Vertex AI: Application Default Credentials are missing or expired, or Google could not be reached\. Run `gcloud auth application-default login`, or set GOOGLE_APPLICATION_CREDENTIALS to a credentials file where the gateway starts; `".*" vertex auth status` prints the reason\.$/,
+      doctor: /^MISSING \(claude-code-proxy got no Google access token for Vertex AI: .*Run `gcloud auth application-default login`/,
+    },
+    'error: no project, or another invalid setting': {
+      auth: 'config-invalid',
+      message: /^claude-code-proxy reports a missing or invalid Vertex AI setting, most often an unset Google Cloud project: set vertex\.project in .*config\.json, or CCP_VERTEX_PROJECT or GOOGLE_CLOUD_PROJECT where the gateway starts\. Run `".*" vertex auth status` to see which setting\.$/,
+      doctor: /^NOT CONFIGURED \(claude-code-proxy reports a missing or invalid Vertex AI setting/,
+    },
+    'error: status did not answer': {
+      auth: 'auth-unknown',
+      message: /^claude-code-proxy could not report Vertex AI sign-in status\.$/,
+      doctor: /^status unavailable$/,
+    },
+  };
+  for (const [name, { auth, message, doctor }] of Object.entries(tests)) {
+    const readiness = getProxyProviderReadiness('vertex', { checks: healthy }, { authState: () => auth });
+    assert.equal(readiness.state, auth, name);
+    assert.equal(readiness.ready, auth === 'ready', name);
+    assert.match(readiness.message, message, name);
+    assert.doesNotMatch(readiness.message, /vertex auth login/, name);
+    assert.match(describeProxyProviderAuth('vertex', auth), doctor, name);
+  }
+  // Only Vertex gives exit 2 its own meaning; doctor still prints the other providers' lines as before.
+  assert.equal(describeProxyProviderAuth('kimi', 'ready'), 'authenticated');
+  assert.equal(describeProxyProviderAuth('opencode', 'ready'), 'API key present');
+  assert.match(describeProxyProviderAuth('kimi', 'auth-missing'), /^MISSING \(claude-code-proxy has no Kimi sign-in\. Run `".*" kimi auth login`\.\)$/);
+  assert.equal(describeProxyProviderAuth('muse', 'auth-unknown'), 'status unavailable');
+});
+
 test('the Sidequest catalog lists every proxy provider under its own slug and readiness', (t) => {
   const { buildCatalog } = require('../lib/commands.js');
   const proxyModels = require('../lib/proxy-models.js');
@@ -321,6 +425,11 @@ test('the Sidequest catalog lists every proxy provider under its own slug and re
     'claude-cursor-agent',
     'claude-grok-composer-2.5-fast',
     'claude-muse-spark-1.3[1m]',
+    'claude-gemini-4-argon[1m]',
+    'claude-vertex/anthropic/claude-opus-5-5[1m]',
+    'claude-vertex/anthropic/claude-sonnet-5-5[1m]',
+    'claude-vertex/mistralai/codestral-2',
+    'claude-vertex/endpoint/my-llm',
     'claude-opus-5-5',
   ], codexReadiness);
 
@@ -336,12 +445,57 @@ test('the Sidequest catalog lists every proxy provider under its own slug and re
     { slug: 'cursor-agent', id: 'claude-cursor-agent', label: 'cursor-agent (Cursor)', provider: 'cursor' },
     { slug: 'grok-composer-2-5-fast', id: 'claude-grok-composer-2.5-fast', label: 'Grok composer 2.5 fast', provider: 'grok' },
     { slug: 'muse-spark-1-3', id: 'claude-muse-spark-1.3[1m]', label: 'muse-spark-1.3 (Muse)', provider: 'muse' },
+    { slug: 'vertex-gemini-4-argon', id: 'claude-gemini-4-argon[1m]', label: 'gemini-4-argon (Vertex AI)', provider: 'vertex' },
+    // The id's own vertex/ namespace is the provider, so the slug names it once.
+    { slug: 'vertex-anthropic-claude-opus-5-5', id: 'claude-vertex/anthropic/claude-opus-5-5[1m]', label: 'vertex/anthropic/claude-opus-5-5 (Vertex AI)', provider: 'vertex' },
+    // Past the 32-character limit a slug keeps its first 25 characters and ends in a hash. The board's
+    // route table pins slugs, so this exact value must not change.
+    { slug: 'vertex-anthropic-claude-s-b52873', id: 'claude-vertex/anthropic/claude-sonnet-5-5[1m]', label: 'vertex/anthropic/claude-sonnet-5-5 (Vertex AI)', provider: 'vertex' },
+    { slug: 'vertex-mistralai-codestral-2', id: 'claude-vertex/mistralai/codestral-2', label: 'vertex/mistralai/codestral-2 (Vertex AI)', provider: 'vertex' },
+    { slug: 'vertex-endpoint-my-llm', id: 'claude-vertex/endpoint/my-llm', label: 'vertex/endpoint/my-llm (Vertex AI)', provider: 'vertex' },
   ]);
-  for (const provider of ['kimi', 'opencode', 'cursor', 'muse']) {
+  for (const provider of ['kimi', 'opencode', 'cursor', 'muse', 'vertex']) {
     assert.equal(catalog.providers[provider].state, 'binary-missing', provider);
     assert.equal(catalog.providers[provider].ready, false, provider);
   }
   assert.equal(catalog.providers.codex.state, 'binary-missing');
+});
+
+test('the catalog reports Vertex AI as not configured on a machine with no project, without a status process', (t) => {
+  const { buildCatalog } = require('../lib/commands.js');
+  const proxyModels = require('../lib/proxy-models.js');
+  const previous = proxyModels.proxyModelRoutes();
+  proxyModels.setProxyModelRoutes(proxyModels.parseProxyModelListing(PROXY_LISTING));
+  t.after(() => proxyModels.setProxyModelRoutes(previous));
+  // The catalog reads the real process environment, so the project variables are cleared and the
+  // proxy's config directory is an empty one for the length of this test.
+  const configDirectory = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'model-gateway-vertex-config-'));
+  const saved = Object.fromEntries(['CCP_VERTEX_PROJECT', 'GOOGLE_CLOUD_PROJECT', 'CCP_CONFIG_DIR'].map((name) => [name, process.env[name]]));
+  delete process.env.CCP_VERTEX_PROJECT;
+  delete process.env.GOOGLE_CLOUD_PROJECT;
+  process.env.CCP_CONFIG_DIR = configDirectory;
+  t.after(() => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fs.rmSync(configDirectory, { recursive: true, force: true });
+  });
+  // Every shared check passes, so only the provider's own state decides. No claude-code-proxy
+  // binary exists under the test home: a status process would fail to start and read as auth-unknown.
+  const codexReadiness = {
+    ready: true,
+    state: 'ready',
+    message: 'ready',
+    checks: { proxyBinary: true, proxyModels: true, shimRunning: true, servingVersionMatches: true },
+  };
+
+  const catalog = buildCatalog(['claude-gemini-4-argon[1m]'], codexReadiness);
+
+  assert.deepEqual(catalog.models.map((model) => [model.id, model.provider, model.contextWindow]), [['claude-gemini-4-argon[1m]', 'vertex', 1000000]]);
+  assert.equal(catalog.providers.vertex.ready, false);
+  assert.equal(catalog.providers.vertex.state, 'config-invalid');
+  assert.match(catalog.providers.vertex.message, /missing or invalid Vertex AI setting, most often an unset Google Cloud project/);
 });
 
 test('a shim that starts before the proxy lists the proxy models without waiting for a request', async (t) => {
@@ -439,4 +593,57 @@ test('Muse rows reach the proxy and compact 40000 below their 1007997 window', a
   assert.equal(error.type, 'request_too_large');
   assert.match(error.message, /^Prompt is too long for the Muse context window; compact and retry\. \(967998 tokens > 967997 tokens\)/);
   assert.equal(proxy.received.length, 1, 'the refused turn is not forwarded');
+});
+
+test('Vertex AI rows reach the proxy and compact 40000 below their documented window', async (t) => {
+  const tests = {
+    'Gemini, a window above the [1m] client window': { model: 'claude-gemini-4-argon[1m]', backend: 'gemini-4-argon', trigger: 1008576 },
+    'Claude on Vertex, a window equal to the client window': { model: 'claude-vertex/anthropic/claude-opus-5-5[1m]', backend: 'vertex/anthropic/claude-opus-5-5', trigger: 960000 },
+    // Not in the fixture listing: a policy row routes to the proxy by itself, as a Muse row does.
+    'Gemma, a window far below the [1m] client window': { model: 'claude-vertex/google/gemma-4-26b-a4b-it-maas[1m]', backend: 'vertex/google/gemma-4-26b-a4b-it-maas', trigger: 222144 },
+  };
+  for (const [name, { model, backend, trigger }] of Object.entries(tests)) {
+    await t.test(name, async (st) => {
+      const proxy = await listingProxy(st, (body, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: {}, usage: { input_tokens: trigger + 1, output_tokens: 1 } })}\n\n`
+          + 'event: message_stop\ndata: {"type":"message_stop"}\n\n');
+      });
+      const anthropic = await anthropicUpstream(st);
+      const { port } = await spawnShim(st, proxy.port, anthropic.url);
+      const session = { 'x-claude-code-session-id': `vertex-sentry-${backend}` };
+
+      const first = await request(port, 'POST', '/v1/messages', messageBody(model), session);
+      assert.equal(first.status, 200, `${name}: ${first.body}`);
+      assert.equal(proxy.received.length, 1, `${name}: the first turn reaches the proxy`);
+      assert.equal(proxy.received[0].body.model, backend, `${name}: the proxy gets the id it listed`);
+      assert.equal(anthropic.received.length, 0, `${name}: nothing reaches api.anthropic.com`);
+
+      const second = await request(port, 'POST', '/v1/messages', messageBody(model), session);
+      assert.equal(second.status, 413, `${name}: the turn after usage passed ${trigger} gets the compaction signal: ${second.body}`);
+      const { error } = JSON.parse(second.body);
+      assert.equal(error.type, 'request_too_large', name);
+      assert.ok(error.message.startsWith(`Prompt is too long for the Vertex AI context window; compact and retry. (${trigger + 1} tokens > ${trigger} tokens)`), `${name}: ${error.message}`);
+      assert.equal(proxy.received.length, 1, `${name}: the refused turn is not forwarded`);
+    });
+  }
+});
+
+test('a Vertex AI row with no policy row has no sentry and forwards every turn', async (t) => {
+  const proxy = await listingProxy(t, (body, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: {}, usage: { input_tokens: 190000, output_tokens: 1 } })}\n\n`
+      + 'event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  });
+  const anthropic = await anthropicUpstream(t);
+  const { port } = await spawnShim(t, proxy.port, anthropic.url);
+  const session = { 'x-claude-code-session-id': 'vertex-unmeasured' };
+
+  // Mistral's documented window is below Claude Code's 200000 unknown-model window, so the row is
+  // an unmeasured one: the backend's own overflow error is the only compaction signal.
+  for (const turn of [1, 2]) {
+    const response = await request(port, 'POST', '/v1/messages', messageBody('claude-vertex/mistralai/codestral-2'), session);
+    assert.equal(response.status, 200, `turn ${turn}: ${response.body}`);
+    assert.equal(proxy.received.length, turn, `turn ${turn} reaches the proxy`);
+  }
 });

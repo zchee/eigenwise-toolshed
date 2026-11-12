@@ -281,6 +281,139 @@ test('window policy marks measured rows and advertises unmeasured Codex defaults
   assert.equal(Object.hasOwn(MODEL_WINDOW_POLICY, 'muse-spark-1.3-contributor'), false);
 });
 
+test('Vertex AI policy rows carry each documented window above 200k and leave the rest unmeasured', (t) => {
+  const { effectiveSentryPolicy, gatewayModel } = require(WORKER);
+  const { MODEL_WINDOW_POLICY, contextWindowCap, gatewayAdvertisedWindow, gatewayClientModelId, resolveGatewayModelPolicy } = require(RUNTIME);
+  const proxyModels = require('../lib/proxy-models.js');
+
+  // Windows as the sources state them: models.dev's google-vertex catalog, and for OpenAI and Muse
+  // the input limits claude-code-proxy's Vertex AI page quotes from Google.
+  const tests = {
+    'Gemini under its bare id': { backendId: 'gemini-4-argon', backendWindow: 1048576, advertised: 1000000 },
+    'Gemini under its vertex/ id': { backendId: 'vertex/gemini-3.5-flash-lite', backendWindow: 1048576, advertised: 1000000 },
+    'Claude on Vertex': { backendId: 'vertex/anthropic/claude-fable-5-2', backendWindow: 1000000, advertised: 1000000 },
+    'Grok 4.7 on Vertex, a window below the [1m] client window': { backendId: 'vertex/xai/grok-4.7', backendWindow: 524288, advertised: 524288 },
+    'Grok 4.20 on Vertex, a window above the [1m] client window': { backendId: 'vertex/xai/grok-4.20-non-reasoning', backendWindow: 2000000, advertised: 1000000 },
+    'OpenAI on Vertex': { backendId: 'vertex/openai/gpt-6.1-sol', backendWindow: 922000, advertised: 922000 },
+    'Muse on Vertex': { backendId: 'vertex/meta/muse-spark-1.3', backendWindow: 1048576, advertised: 1000000 },
+    'GLM 5.2': { backendId: 'vertex/zai-org/glm-5.2-maas', backendWindow: 1000000, advertised: 1000000 },
+    'Gemma 4': { backendId: 'vertex/google/gemma-4-26b-a4b-it-maas', backendWindow: 262144, advertised: 262144 },
+    'Llama 4 Maverick': { backendId: 'vertex/meta/llama-4-maverick-17b-128e-instruct-maas', backendWindow: 524288, advertised: 524288 },
+    'Llama 4 Scout': { backendId: 'vertex/meta/llama-4-scout-17b-16e-instruct-maas', backendWindow: 1310720, advertised: 1000000 },
+  };
+  for (const [name, { backendId, backendWindow, advertised }] of Object.entries(tests)) {
+    const policy = resolveGatewayModelPolicy(`claude-${backendId}[1m]`);
+    assert.equal(policy.backend, 'vertex', name);
+    assert.equal(policy.transport, 'proxy', `${name}: only claude-code-proxy serves Vertex AI`);
+    assert.equal(policy.backendId, backendId, name);
+    assert.equal(policy.backendWindow, backendWindow, name);
+    assert.equal(policy.pickerAlias, `claude-${backendId}[1m]`, name);
+    assert.equal(policy.sentry, 'synthetic-413', name);
+    assert.match(policy.measurement, /\b2026-11-12\b.*; not a live probe$/, `${name}: the row names its dated source`);
+    assert.equal(gatewayClientModelId(backendId), `claude-${backendId}[1m]`, `${name}: a window above 200k takes the [1m] alias`);
+    assert.equal(gatewayModel(backendId, 'vertex').max_input_tokens, advertised, `${name}: never advertised above the [1m] client window`);
+    assert.equal(effectiveSentryPolicy(policy).compactTrigger, backendWindow - 40000, `${name}: the sentry keeps one turn of headroom`);
+  }
+
+  // Every name claude-code-proxy's vertex provider lists at dev c31326c with no deployed endpoint
+  // configured, copied from its /v1/models. A row whose id is not one of these could never match
+  // a listed model, and a registered model missing below would silently stay a 200k row.
+  const registered = [
+    'gemini-3-flash-preview', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.7-flash',
+    'gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon', 'vertex/anthropic/claude-fable-5', 'vertex/anthropic/claude-fable-5-1',
+    'vertex/anthropic/claude-fable-5-2', 'vertex/anthropic/claude-haiku-4-5@20251001', 'vertex/anthropic/claude-haiku-5-5',
+    'vertex/anthropic/claude-opus-4-5@20251101', 'vertex/anthropic/claude-opus-4-6', 'vertex/anthropic/claude-opus-4-7',
+    'vertex/anthropic/claude-opus-4-8', 'vertex/anthropic/claude-opus-5', 'vertex/anthropic/claude-opus-5-5', 'vertex/anthropic/claude-sonnet-4-6',
+    'vertex/anthropic/claude-sonnet-5', 'vertex/anthropic/claude-sonnet-5-5', 'vertex/deepseek-ai/deepseek-v4.1-flash-maas',
+    'vertex/gemini-3-flash-preview', 'vertex/gemini-3.1-flash-lite', 'vertex/gemini-3.1-pro-preview', 'vertex/gemini-3.5-flash',
+    'vertex/gemini-3.5-flash-lite', 'vertex/gemini-3.7-flash', 'vertex/gemini-3.8-flash', 'vertex/gemini-4-argon', 'vertex/gemini-4-carbon',
+    'vertex/google/gemma-4-26b-a4b-it-maas', 'vertex/meta/llama-4-maverick-17b-128e-instruct-maas', 'vertex/meta/llama-4-scout-17b-16e-instruct-maas',
+    'vertex/meta/muse-ember-1.0', 'vertex/meta/muse-spark-1.3', 'vertex/meta/muse-wonder-1.0', 'vertex/mistralai/codestral-2',
+    'vertex/mistralai/mistral-medium-3', 'vertex/mistralai/mistral-small-2503', 'vertex/openai/gpt-6-astra', 'vertex/openai/gpt-6-luna',
+    'vertex/openai/gpt-6.1-sol', 'vertex/openai/gpt-6.1-terra', 'vertex/openai/gpt-oss-120b-maas', 'vertex/xai/grok-4.20-non-reasoning',
+    'vertex/xai/grok-4.20-reasoning', 'vertex/xai/grok-4.3', 'vertex/xai/grok-4.6', 'vertex/xai/grok-4.7', 'vertex/zai-org/glm-5.2-maas',
+  ];
+  const gemini = [
+    'gemini-3-flash-preview', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3.5-flash', 'gemini-3.5-flash-lite',
+    'gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon',
+  ];
+  const documentedWindows = {
+    1048576: [...gemini, ...gemini.map((id) => `vertex/${id}`), 'vertex/meta/muse-ember-1.0', 'vertex/meta/muse-spark-1.3', 'vertex/meta/muse-wonder-1.0'],
+    1000000: [
+      'vertex/anthropic/claude-fable-5', 'vertex/anthropic/claude-fable-5-1', 'vertex/anthropic/claude-fable-5-2',
+      'vertex/anthropic/claude-haiku-5-5', 'vertex/anthropic/claude-opus-4-6', 'vertex/anthropic/claude-opus-4-7',
+      'vertex/anthropic/claude-opus-4-8', 'vertex/anthropic/claude-opus-5', 'vertex/anthropic/claude-opus-5-5',
+      'vertex/anthropic/claude-sonnet-4-6', 'vertex/anthropic/claude-sonnet-5', 'vertex/anthropic/claude-sonnet-5-5',
+      'vertex/zai-org/glm-5.2-maas',
+    ],
+    922000: ['vertex/openai/gpt-6-astra', 'vertex/openai/gpt-6-luna', 'vertex/openai/gpt-6.1-sol', 'vertex/openai/gpt-6.1-terra'],
+    524288: ['vertex/meta/llama-4-maverick-17b-128e-instruct-maas', 'vertex/xai/grok-4.6', 'vertex/xai/grok-4.7'],
+    2000000: ['vertex/xai/grok-4.20-non-reasoning', 'vertex/xai/grok-4.20-reasoning'],
+    1310720: ['vertex/meta/llama-4-scout-17b-16e-instruct-maas'],
+    262144: ['vertex/google/gemma-4-26b-a4b-it-maas'],
+  };
+  const expectedRows = Object.entries(documentedWindows)
+    .flatMap(([backendWindow, ids]) => ids.map((id) => [id, Number(backendWindow)]))
+    .sort(([left], [right]) => (left < right ? -1 : 1));
+  const vertexRows = Object.values(MODEL_WINDOW_POLICY).filter((policy) => policy.backend === 'vertex');
+  assert.deepEqual(
+    vertexRows.map((policy) => [policy.backendId, policy.backendWindow]).sort(([left], [right]) => (left < right ? -1 : 1)),
+    expectedRows,
+  );
+  assert.equal(vertexRows.length, 45);
+  assert.deepEqual(expectedRows.map(([id]) => id).filter((id) => !registered.includes(id)), [], 'every row is a name the proxy registers');
+  // The proxy lists every registered Gemini model twice; both spellings are one model with one window.
+  const bareGeminiIds = vertexRows.map((policy) => policy.backendId).filter((id) => !id.includes('/'));
+  assert.equal(bareGeminiIds.length, 9);
+  for (const id of bareGeminiIds) {
+    const { backendId, pickerAlias, ...shared } = MODEL_WINDOW_POLICY[id];
+    const { backendId: prefixedId, pickerAlias: prefixedAlias, ...prefixed } = MODEL_WINDOW_POLICY[`vertex/${id}`];
+    assert.deepEqual(prefixed, shared, id);
+    assert.equal(prefixedId, `vertex/${id}`);
+    assert.equal(prefixedAlias, `claude-vertex/${id}[1m]`);
+  }
+
+  // A Vertex OpenAI row is not a Codex row: Codex's default 272000 cap and its tier suffixes do not apply.
+  assert.equal(gatewayAdvertisedWindow('claude-vertex/openai/gpt-6.1-sol[1m]'), 922000);
+  assert.equal(gatewayAdvertisedWindow('claude-gpt-6.1-sol[1m]'), 272000);
+  assert.equal(contextWindowCap('vertex', { codex: { value: 272000 }, grok: { value: 300000 } }), null);
+
+  // Registered models with a documented window at or below 200k, one with no documented window,
+  // and a deployed endpoint have no row. The listing alone makes them proxy rows, at 200k.
+  const unmeasuredIds = [
+    'vertex/anthropic/claude-opus-4-5@20251101',
+    'vertex/anthropic/claude-haiku-4-5@20251001',
+    'vertex/xai/grok-4.3',
+    'vertex/mistralai/mistral-medium-3',
+    'vertex/mistralai/mistral-small-2503',
+    'vertex/mistralai/codestral-2',
+    'vertex/openai/gpt-oss-120b-maas',
+    'vertex/deepseek-ai/deepseek-v4.1-flash-maas',
+    'vertex/endpoint/my-llm',
+  ];
+  // Those are all the registered names without a row; vertex/endpoint/<name> comes from a user's config.json.
+  assert.deepEqual(
+    registered.filter((id) => !Object.hasOwn(MODEL_WINDOW_POLICY, id)).sort(),
+    unmeasuredIds.filter((id) => id !== 'vertex/endpoint/my-llm').sort(),
+  );
+  for (const backendId of unmeasuredIds) {
+    assert.equal(Object.hasOwn(MODEL_WINDOW_POLICY, backendId), false, backendId);
+    assert.equal(resolveGatewayModelPolicy(`claude-${backendId}`).transport, 'anthropic', `${backendId}: not a proxy route until the proxy lists it`);
+  }
+  const previous = proxyModels.proxyModelRoutes();
+  t.after(() => proxyModels.setProxyModelRoutes(previous));
+  proxyModels.setProxyModelRoutes(unmeasuredIds.map((id) => ({ id, provider: 'vertex' })));
+  for (const backendId of unmeasuredIds) {
+    const policy = resolveGatewayModelPolicy(`claude-${backendId}`);
+    assert.equal(policy.backend, 'vertex', backendId);
+    assert.equal(policy.transport, 'proxy', backendId);
+    assert.equal(policy.sentry, 'none', backendId);
+    assert.match(policy.measurement, /^unmeasured default for claude-code-proxy vertex rows/, backendId);
+    assert.equal(gatewayClientModelId(backendId), `claude-${backendId}`, `${backendId}: no [1m] alias`);
+    assert.equal(gatewayModel(backendId, 'vertex').max_input_tokens, 200000, backendId);
+  }
+});
+
 test('Codex sentry derives a headroom-preserving trigger for each policy row', () => {
   const { effectiveSentryPolicy } = require(WORKER);
   const { resolveGatewayModelPolicy } = require(RUNTIME);
@@ -1670,6 +1803,11 @@ test('doctor policy table includes gateway and native model rows', () => {
   assert.equal(rows.some((row) => row.backendId.startsWith('muse-')), false);
   const liveMuseRows = modelWindowPolicyRows(['muse-spark-1.3']);
   assert.equal(liveMuseRows.some((row) => row.backendId === 'muse-spark-1.3' && row.pickerId === 'claude-muse-spark-1.3[1m]'), true);
+  // So are Vertex AI rows, under either id shape.
+  assert.equal(rows.some((row) => row.backendId.startsWith('vertex/') || row.backendId.startsWith('gemini-')), false);
+  const liveVertexRows = modelWindowPolicyRows(['gemini-4-argon', 'vertex/anthropic/claude-opus-5-5']);
+  assert.equal(liveVertexRows.some((row) => row.backendId === 'gemini-4-argon' && row.pickerId === 'claude-gemini-4-argon[1m]'), true);
+  assert.equal(liveVertexRows.some((row) => row.backendId === 'vertex/anthropic/claude-opus-5-5' && row.pickerId === 'claude-vertex/anthropic/claude-opus-5-5[1m]'), true);
 
   // Hardcoding the alias ids here read the developer's own ~/.claude detected-pin cache: a machine that
   // had probed its CLI resolved fable to claude-fable-5 while the shipped constant says claude-fable-5-1,

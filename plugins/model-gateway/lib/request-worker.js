@@ -1557,23 +1557,56 @@ function runWorker() {
     });
   }
 
+  // Claude Code loads deferred tools with tool_addition blocks, typically inside a
+  // mid-conversation role:"system" message. No proxy backend knows the block (LM Studio
+  // answers 400 "Invalid literal value, expected \"text\""), so each one is removed and its
+  // tool goes into the request's tools list instead.
+  function stripToolAdditions(content, addedDefinitions, addedReferences) {
+    return content.filter((block) => {
+      if (!block || typeof block !== 'object' || block.type !== 'tool_addition') return true;
+      const tool = block.tool;
+      if (tool?.type === 'tool_definition' && tool.definition && typeof tool.definition.name === 'string') {
+        addedDefinitions.set(tool.definition.name, tool.definition);
+      } else if (tool?.type === 'tool_reference' && typeof tool.name === 'string') {
+        addedReferences.add(tool.name);
+      }
+      return false;
+    });
+  }
+
   function resolveCodexDeferredTools(request) {
     const referencedTools = new Set();
+    const addedDefinitions = new Map();
+    const addedReferences = new Set();
     if (Array.isArray(request.messages)) {
-      request.messages = request.messages.map((message) => {
-        if (!message || typeof message !== 'object' || !Array.isArray(message.content)) return message;
-        return { ...message, content: renderCodexToolReferences(message.content, referencedTools) };
+      request.messages = request.messages.flatMap((message) => {
+        if (!message || typeof message !== 'object' || !Array.isArray(message.content)) return [message];
+        const content = stripToolAdditions(message.content, addedDefinitions, addedReferences);
+        if (content.length === 0 && message.content.length > 0) return [];
+        return [{ ...message, content: renderCodexToolReferences(content, referencedTools) }];
       });
     }
-    if (!Array.isArray(request.tools)) return;
-    request.tools = request.tools.flatMap((tool) => {
+    if (!Array.isArray(request.tools) && addedDefinitions.size === 0) return;
+    const tools = Array.isArray(request.tools) ? request.tools : [];
+    // A referenced tool without input_schema is an Anthropic server tool (advisor, for one),
+    // which no proxy backend can run, so only client tools are loaded by reference.
+    const loads = (tool) => referencedTools.has(tool.name) || addedDefinitions.has(tool.name)
+      || (addedReferences.has(tool.name) && Object.prototype.hasOwnProperty.call(tool, 'input_schema'));
+    request.tools = tools.flatMap((tool) => {
       if (!tool || typeof tool !== 'object') return [tool];
-      if (tool.defer_loading === true && !referencedTools.has(tool.name)) return [];
+      if (tool.defer_loading === true && !loads(tool)) return [];
       if (!Object.prototype.hasOwnProperty.call(tool, 'defer_loading')) return [tool];
       const loadedTool = { ...tool };
       delete loadedTool.defer_loading;
       return [loadedTool];
     });
+    const presentNames = new Set(request.tools.map((tool) => tool?.name));
+    for (const [name, definition] of addedDefinitions) {
+      if (presentNames.has(name)) continue;
+      const loadedTool = { ...definition };
+      delete loadedTool.defer_loading;
+      request.tools.push(loadedTool);
+    }
   }
 
   function rewriteResponseModel(value, advertisedModel, backendModel = null) {

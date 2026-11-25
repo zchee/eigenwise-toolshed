@@ -225,3 +225,106 @@ test('Codex tool search resolves references while Anthropic passthrough stays by
   assert.equal(forwardedToAnthropic, anthropicRaw);
   assert.equal(forwardedToCodex.length, 2);
 });
+
+async function startCodexFixture(t) {
+  const shimPort = await freePort();
+  const proxyPort = await freePort();
+  const forwarded = [];
+  const proxy = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ data: [{ id: 'gpt-5.6-sol' }] }));
+    }
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      forwarded.push(JSON.parse(Buffer.concat(chunks).toString()));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'message', model: 'gpt-5.6-sol', content: [] }));
+    });
+  });
+  await new Promise((resolve) => proxy.listen(proxyPort, '127.0.0.1', resolve));
+  t.after(() => proxy.close());
+  const child = spawnGatewayProcess(t, process.execPath, [CLI, 'serve-shim'], {
+    env: {
+      ...process.env,
+      CODEX_GATEWAY_PORT: String(shimPort),
+      CODEX_GATEWAY_PROXY_PORT: String(proxyPort),
+      CODEX_GATEWAY_REQUEST_LOG: '0',
+      CODEX_GATEWAY_SENTRY: '0',
+    },
+    stdio: 'ignore',
+  });
+  t.after(() => child.kill());
+  await waitForHealthz(shimPort);
+  return { shimPort, forwarded };
+}
+
+function toolAdditionDefinition(name) {
+  return { type: 'tool_addition', tool: { type: 'tool_definition', definition: tool(name) } };
+}
+
+function toolAdditionReference(name) {
+  return { type: 'tool_addition', tool: { type: 'tool_reference', name } };
+}
+
+test('proxy routes turn tool_addition blocks into tools entries and drop the blocks', async (t) => {
+  const { shimPort, forwarded } = await startCodexFixture(t);
+
+  const systemTurn = {
+    role: 'system',
+    content: [
+      { type: 'text', text: 'SessionStart hook additional context' },
+      toolAdditionDefinition('mcp__docs__batch'),
+      toolAdditionDefinition('Bash'),
+      toolAdditionReference('advisor'),
+      toolAdditionReference('mcp__sidequest_board__list'),
+    ],
+  };
+  const additionsOnlyTurn = {
+    role: 'system',
+    content: [toolAdditionDefinition('mcp__docs__batch'), toolAdditionReference('mcp__sidequest_board__list')],
+  };
+  const tools = [
+    tool('ToolSearch'),
+    tool('Bash', false),
+    { type: 'advisor_20260301', name: 'advisor', model: 'claude-fable-5-1', defer_loading: true },
+    tool('mcp__sidequest_board__list', true),
+    tool('mcp__sidequest_board__comments', true),
+  ];
+  const body = JSON.stringify({
+    model: 'claude-gpt-5.6-sol',
+    max_tokens: 32,
+    messages: [
+      { role: 'user', content: 'hi' },
+      systemTurn,
+      { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+      additionsOnlyTurn,
+      { role: 'user', content: 'list the board' },
+    ],
+    tools,
+  });
+  const response = await request(shimPort, '/v1/messages', body);
+  assert.equal(response.status, 200, response.body);
+  const payload = forwarded[0];
+  assert.equal(JSON.stringify(payload).includes('tool_addition'), false, 'no tool_addition block reaches the backend');
+  assert.deepEqual(payload.messages.map(({ role }) => role), ['user', 'system', 'assistant', 'user'],
+    'a system turn that held only tool additions is dropped, the one with text stays');
+  assert.deepEqual(payload.messages[1].content, [{ type: 'text', text: 'SessionStart hook additional context' }]);
+  assert.deepEqual(payload.tools.map(({ name }) => name), [
+    'ToolSearch',
+    'Bash',
+    'mcp__sidequest_board__list',
+    'mcp__docs__batch',
+  ], 'definitions are appended once by name, a referenced client tool is loaded, the advisor server tool and unreferenced deferred tools stay out');
+  assert.equal(payload.tools.some((entry) => 'defer_loading' in entry), false);
+
+  const noTools = await request(shimPort, '/v1/messages', JSON.stringify({
+    model: 'claude-gpt-5.6-sol',
+    max_tokens: 32,
+    messages: [{ role: 'user', content: 'hi' }, { role: 'system', content: [toolAdditionDefinition('mcp__docs__batch')] }],
+  }));
+  assert.equal(noTools.status, 200, noTools.body);
+  assert.deepEqual(forwarded[1].messages.map(({ role }) => role), ['user']);
+  assert.deepEqual(forwarded[1].tools.map(({ name }) => name), ['mcp__docs__batch'], 'a definition creates the tools list when the request had none');
+});

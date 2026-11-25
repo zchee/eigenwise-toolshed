@@ -17,7 +17,7 @@ flowchart LR
   CC --> W[Model Gateway shim]
   W --> P[Local proxy]
   W --> AN[Anthropic API for Claude models]
-  P --> API[Codex, Kimi, Cursor, Muse, Vertex AI, OpenCode Go, and Grok backends, and a local llama-server]
+  P --> API[Codex, Kimi, Cursor, Muse, Vertex AI, OpenCode Go, and Grok backends, a local llama-server, and LM Studio]
 ```
 
 - Quartermaster owns the cross-plugin setup plan for new and existing projects, updates Toolshed plugins, and checks workspace health.

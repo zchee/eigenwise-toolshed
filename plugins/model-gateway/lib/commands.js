@@ -47,9 +47,15 @@ const { fetchLatestRelease } = require('./github-release.js');
 const { createGatewayUsageEmitter, recordRequestBodyHighWater } = require('./usage-observability.js');
 const grokBackend = require('./grok-backend.js');
 const {
-  localServerState, parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes, setProxyModelRoutes,
+  lmStudioServerState, localServerState, parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes,
+  setProxyModelRoutes,
 } = require('./proxy-models.js');
 const { LLAMA_PORT_ENV, LOCAL_PROVIDER, llamaServerPort, refreshLocalServerState } = require('./local-llama.js');
+const {
+  LMSTUDIO_API_KEY_ENV, LMSTUDIO_BASE_URL_ENV, LMSTUDIO_ENABLED_ENV, LMSTUDIO_PROVIDER, LM_STUDIO_TOKEN_ENV, lmStudioSettings,
+  refreshLmStudioState,
+} = require('./lmstudio.js');
+const { proxyConfigDirectory, readProxyConfig } = require('./proxy-config.js');
 const {
   canReplaceInstalledCliPath, CLI_PATH, GATEWAY_MODELS_CACHE, MODEL_WINDOW_POLICY, resolveStableCommandPath,
   gatewayAdvertisedWindow, gatewayClientModelId, gatewayDiscoveryModels, readGatewayDiscoveryCache,
@@ -1408,7 +1414,7 @@ async function doctor({ readiness: suppliedReadiness = null } = {}) {
   if (readiness.checks.proxyBinary && await loadProxyModelRoutes()) {
     const providers = [...new Set(proxyModelRoutes().map((route) => route.provider))].filter((provider) => provider !== 'codex');
     for (const provider of providers) {
-      const subject = provider === LOCAL_PROVIDER ? 'server' : 'auth';
+      const subject = SERVER_PROVIDERS.has(provider) ? 'server' : 'auth';
       log(`proxy ${provider} ${subject}: ${describeProxyProviderAuth(provider, proxyProviderAuthState(provider))}`);
       if (provider === LOCAL_PROVIDER) {
         const mismatch = localWindowMismatch(await fetchShimModels().catch(() => []));
@@ -1654,14 +1660,6 @@ function getGrokReadiness({ readAuth = grokBackend.readGrokAuth } = {}) {
   }
 }
 
-// Mirrors claude-code-proxy's paths::resolve_config_dir, where it reads config.json.
-function proxyConfigDirectory({ env = process.env, platform = process.platform, home = os.homedir() } = {}) {
-  if (env.CCP_CONFIG_DIR) return env.CCP_CONFIG_DIR;
-  if (platform === 'win32') return path.join(env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'claude-code-proxy');
-  if (platform === 'darwin') return path.join(home, '.config', 'claude-code-proxy');
-  return path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), 'claude-code-proxy');
-}
-
 // `claude-code-proxy <provider> auth status` exits 0 when signed in and 1 when not. OpenCode Go
 // has no auth subcommand: the proxy reads an API key from its environment or config.json, so only
 // its presence can be checked, and only in this process's environment. Vertex AI has no sign-in of
@@ -1676,17 +1674,18 @@ function proxyConfigDirectory({ env = process.env, platform = process.platform, 
 function vertexProjectIsSet(env, configDirectory) {
   const isSet = (value) => typeof value === 'string' && value.trim() !== '';
   return isSet(env.CCP_VERTEX_PROJECT) || isSet(env.GOOGLE_CLOUD_PROJECT)
-    || isSet(readJsonFile(path.join(configDirectory, 'config.json'))?.vertex?.project);
+    || isSet(readProxyConfig(configDirectory)?.vertex?.project);
 }
 
 function proxyProviderAuthState(provider, { run = spawnSync, env = process.env, configDirectory = proxyConfigDirectory() } = {}) {
   if (provider === 'opencode') {
     if (env.CCP_OPENCODE_API_KEY || env.OPENCODE_API_KEY) return 'ready';
-    const apiKey = readJsonFile(path.join(configDirectory, 'config.json'))?.opencode?.apiKey;
+    const apiKey = readProxyConfig(configDirectory)?.opencode?.apiKey;
     return typeof apiKey === 'string' && apiKey ? 'ready' : 'auth-missing';
   }
   if (provider === 'vertex' && !vertexProjectIsSet(env, configDirectory)) return 'config-invalid';
   if (provider === LOCAL_PROVIDER) return localServerReadinessState(env, localServerState());
+  if (provider === LMSTUDIO_PROVIDER) return lmStudioReadinessState(lmStudioSettings({ env, configDirectory }), lmStudioServerState());
   const result = run(PROXY_BIN, [provider, 'auth', 'status'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
   if (result.status === 0) return 'ready';
   if (result.status === 1) return 'auth-missing';
@@ -1735,10 +1734,54 @@ const LOCAL_SERVER_READINESS_REASONS = {
   'auth-unknown': () => 'the llama-server behind local/gguf has not been probed in this process yet.',
 };
 
+// LM Studio has no proxy sign-in either, and `claude-code-proxy lmstudio auth status` exits 0
+// whatever the server does. Its readiness is what LM Studio's own model listing answered on the
+// last probe (loadProxyModelRoutes runs it), at the address this process's settings name. A server
+// that asks for a token it was not given is the one state that is about credentials.
+function lmStudioReadinessState(settings, state) {
+  if (!settings.enabled || settings.invalid) return 'config-invalid';
+  if (!state || state.baseUrl !== settings.baseUrl) return 'auth-unknown';
+  if (state.authRequired) return 'auth-missing';
+  return state.reachable ? 'ready' : 'backend-down';
+}
+
+// Where the proxy reads an LM Studio setting from, for the messages that ask for one to be changed.
+function lmStudioSettingPlaces(configKey) {
+  return `where the gateway starts (the proxy inherits the gateway's environment), or ${configKey} in ${path.join(proxyConfigDirectory(), 'config.json')}`;
+}
+
+const LMSTUDIO_READINESS_REASONS = {
+  'config-invalid': (env) => {
+    const { invalid } = lmStudioSettings({ env });
+    const problem = invalid
+      ? `the LM Studio setting ${invalid.setting} is invalid where this check runs (${invalid.reason}), and the proxy fails every LM Studio request while it is. Correct ${LMSTUDIO_BASE_URL_ENV} ${lmStudioSettingPlaces('lmstudio.baseUrl')}`
+      : `the provider is turned off where this check runs, so its settings differ from the running gateway's. Use the same ${LMSTUDIO_ENABLED_ENV} ${lmStudioSettingPlaces('lmstudio.enabled')}`;
+    return `claude-code-proxy lists LM Studio models, but ${problem}, then restart the gateway: ${localServerRestartHint()}.`;
+  },
+  'backend-down': () => {
+    const state = lmStudioServerState();
+    return `LM Studio's server is not answering at ${state?.baseUrl}${state?.error ? ` (${state.error})` : ''}. Start it with \`lms server start\` or from the LM Studio app's Developer page; LM Studio 0.4.1 or later is required.`;
+  },
+  'auth-missing': () => {
+    const state = lmStudioServerState();
+    const fix = state?.hasApiKey ? 'refused the API token it was sent: check' : 'requires an API token: set';
+    return `LM Studio at ${state?.baseUrl} ${fix} ${LMSTUDIO_API_KEY_ENV} (or ${LM_STUDIO_TOKEN_ENV}) ${lmStudioSettingPlaces('lmstudio.apiKey')}; the token comes from LM Studio's server settings. Then restart the gateway: ${localServerRestartHint()}.`;
+  },
+  'auth-unknown': () => 'the LM Studio server has not been probed in this process yet.',
+};
+
+// Providers whose readiness is a model server on the user's machine rather than a proxy sign-in.
+const SERVER_READINESS_REASONS = new Map([
+  [LOCAL_PROVIDER, LOCAL_SERVER_READINESS_REASONS],
+  [LMSTUDIO_PROVIDER, LMSTUDIO_READINESS_REASONS],
+]);
+const SERVER_PROVIDERS = new Set(SERVER_READINESS_REASONS.keys());
+
 // env is the environment the state was decided from, so the explanation names the same value.
 function proxyProviderReason(state, provider, label, env = process.env) {
-  const local = provider === LOCAL_PROVIDER ? LOCAL_SERVER_READINESS_REASONS[state] : undefined;
-  return local ? local(env) : PROXY_PROVIDER_READINESS_REASONS[state]?.(provider, label);
+  const reasons = SERVER_READINESS_REASONS.get(provider);
+  const own = reasons && Object.hasOwn(reasons, state) ? reasons[state] : null;
+  return own ? own(env) : PROXY_PROVIDER_READINESS_REASONS[state]?.(provider, label);
 }
 
 // Providers the proxy signs in to itself take `<provider> auth login`; these two do not.
@@ -1762,6 +1805,7 @@ const PROXY_PROVIDER_READINESS_REASONS = {
 function proxyProviderCredentialCheck(provider) {
   if (provider === 'opencode') return 'API key presence';
   if (provider === LOCAL_PROVIDER) return 'llama-server reachability';
+  if (provider === LMSTUDIO_PROVIDER) return 'LM Studio server reachability';
   return provider === 'vertex' ? 'Google credentials and Vertex settings' : 'authentication';
 }
 
@@ -1775,9 +1819,27 @@ function describeLocalServer(state = localServerState()) {
   return `llama-server answering on 127.0.0.1:${state?.port}, ${context}${small}`;
 }
 
+// One line for doctor: which models LM Studio has loaded and with what context, since that context
+// is each row's window, and what an unloaded model's row is until LM Studio loads it.
+function describeLmStudioServer(state = lmStudioServerState()) {
+  const models = [...(state?.models ?? [])];
+  const loaded = models.filter(([, model]) => model.loaded);
+  const contexts = loaded.map(([key, { contextWindow }]) => `${key} context ${contextWindow ? `${contextWindow} tokens` : 'unknown'}`);
+  const small = loaded.filter(([, { contextWindow }]) => contextWindow && contextWindow < LOCAL_MIN_SENTRY_WINDOW).map(([key]) => key);
+  const parts = [`LM Studio answering at ${state?.baseUrl}, ${models.length} model${models.length === 1 ? '' : 's'}, ${loaded.length} loaded${contexts.length ? ` (${contexts.join(', ')})` : ''}`];
+  if (small.length) {
+    parts.push(`WARNING: ${small.join(', ')} loaded below ${LOCAL_MIN_SENTRY_WINDOW}, so there is no compaction sentry and Claude Code's own first request (about 13k tokens) leaves little room: \`lms unload <model key>\`, then \`lms load <model key> --context-length ${LOCAL_MIN_SENTRY_WINDOW}\` or more`);
+  }
+  if (loaded.length < models.length) {
+    parts.push('a model that is not loaded is an unmeasured 200k row with no compaction sentry until LM Studio loads it, which it does on the first request with that model\'s default context: load it first with `lms load <model key> --context-length <tokens>`');
+  }
+  return parts.join('; ');
+}
+
 function describeProxyProviderAuth(provider, state, env = process.env) {
   if (state === 'ready') {
     if (provider === LOCAL_PROVIDER) return describeLocalServer();
+    if (provider === LMSTUDIO_PROVIDER) return describeLmStudioServer();
     return provider === 'opencode' ? 'API key present' : 'authenticated';
   }
   const reason = proxyProviderReason(state, provider, providerLabel(provider), env);
@@ -1963,7 +2025,7 @@ async function loadProxyModelRoutes() {
     const routes = parseProxyModelListing(JSON.parse(response.body.toString()).data);
     if (!routes.length) return false;
     setProxyModelRoutes(routes);
-    await refreshLocalServerState(routes, { fetchUrl });
+    await Promise.all([refreshLocalServerState(routes, { fetchUrl }), refreshLmStudioState(routes, { fetchUrl })]);
     return true;
   } catch { return false; }
 }

@@ -5,8 +5,9 @@ const os = require('node:os');
 const path = require('node:path');
 const grokBackend = require('./grok-backend.js');
 const { writeFileAtomically } = require('./atomic-file.js');
-const { CODEX_FAMILY_RE, localServerState, proxyModelProvider } = require('./proxy-models.js');
+const { CODEX_FAMILY_RE, lmStudioServerState, localServerState, proxyModelProvider } = require('./proxy-models.js');
 const { LOCAL_PROVIDER } = require('./local-llama.js');
+const { LMSTUDIO_MODEL_PREFIX, LMSTUDIO_PROVIDER } = require('./lmstudio.js');
 
 const WIN = process.platform === 'win32';
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
@@ -373,34 +374,39 @@ function gatewayBackendModelId(id) {
 // suffixed id shares its base model's window policy.
 const CODEX_SERVICE_TIER_SUFFIX = /-(?:ultra)?fast$/;
 
+// Only a Codex id carries a tier: another provider's id ending the same way is a model of its own
+// (an LM Studio model key is whatever its publisher chose), and must not share sentry state with
+// the id that lacks the ending.
 function codexContextWindowModelId(id) {
-  const baseId = gatewayBackendModelId(id).replace(CODEX_SERVICE_TIER_SUFFIX, '');
+  const backendId = gatewayBackendModelId(id);
+  const baseId = backendId.startsWith('gpt-') ? backendId.replace(CODEX_SERVICE_TIER_SUFFIX, '') : backendId;
   return baseId || 'default';
 }
 
-// The local row's window is the n_ctx of the llama-server the user started, read live from its
-// /props. Claude Code's own first request measured 12732 tokens on 2026-11-25 (Claude Code 2.1.332,
-// no MCP servers, Qwen3 tokenizer through llama-server b12110). The sentry keeps a third of the
-// window (at most the usual 40000) for the turn that crosses the trigger, the compaction prompt and
-// the summary, because the compaction request resends the whole conversation to the same server.
-// Below 32768 the trigger would sit within a few thousand tokens of that first request, so such a
-// row gets no sentry; doctor reports it and an overflow still comes back as a 413.
+// A row served by a model server on the user's own machine (the local llama-server row, an LM
+// Studio model) has the window that server was started or loaded with, read live. Claude Code's own
+// first request measured 12732 tokens on 2026-11-25 (Claude Code 2.1.332, no MCP servers, Qwen3
+// tokenizer through llama-server b12110). The sentry keeps a third of the window (at most the usual
+// 40000) for the turn that crosses the trigger, the compaction prompt and the summary, because the
+// compaction request resends the whole conversation to the same server. Below 32768 the trigger
+// would sit within a few thousand tokens of that first request, so such a row gets no sentry;
+// doctor reports it and an overflow still comes back as a 413.
 const LOCAL_MIN_SENTRY_WINDOW = 32768;
 
 function localCompactHeadroom(window) {
   return Math.min(CODEX_COMPACT_HEADROOM, Math.floor(window / 3));
 }
 
-function localServerPolicy(state) {
-  const backendWindow = state?.contextWindow;
+// null when the server reported no usable window, which leaves the row an unmeasured one.
+function liveWindowPolicy(backend, backendWindow, measurement) {
   if (!Number.isSafeInteger(backendWindow) || backendWindow <= 0) return null;
   const guarded = backendWindow >= LOCAL_MIN_SENTRY_WINDOW;
   return {
-    backend: LOCAL_PROVIDER,
+    backend,
     transport: 'proxy',
     backendId: null,
     backendWindow,
-    measurement: `llama-server /props n_ctx ${backendWindow} on 127.0.0.1:${state.port}, read live`,
+    measurement,
     pickerAliasTemplate: 'claude-{backendId}[1m]',
     advertisedWindow: Math.min(backendWindow, PICKER_ALIAS_CLIENT_WINDOW),
     ...(guarded ? { compactHeadroom: localCompactHeadroom(backendWindow) } : {}),
@@ -408,14 +414,27 @@ function localServerPolicy(state) {
   };
 }
 
+function localServerPolicy(state) {
+  const backendWindow = state?.contextWindow;
+  return liveWindowPolicy(LOCAL_PROVIDER, backendWindow, `llama-server /props n_ctx ${backendWindow} on 127.0.0.1:${state?.port}, read live`);
+}
+
+// An LM Studio row's window is the context its model is loaded with. A model LM Studio has not
+// loaded has none yet, so its row stays unmeasured until a refresh sees it loaded.
+function lmStudioModelPolicy(state, backendId) {
+  if (typeof backendId !== 'string' || !backendId.startsWith(LMSTUDIO_MODEL_PREFIX)) return null;
+  const backendWindow = state?.models?.get(backendId.slice(LMSTUDIO_MODEL_PREFIX.length))?.contextWindow;
+  return liveWindowPolicy(LMSTUDIO_PROVIDER, backendWindow, `LM Studio /api/v1/models loaded context_length ${backendWindow} at ${state?.baseUrl}, read live`);
+}
+
 // claude-code-proxy providers other than Codex publish no context window, and the table above
 // admits only measured rows. Advertising Claude Code's own unknown-model window keeps the client
 // compacting well before a smaller backend limit; a real overflow still comes back as a 413.
-function proxyProviderPolicy(provider) {
-  if (provider === LOCAL_PROVIDER) {
-    const measured = localServerPolicy(localServerState());
-    if (measured) return measured;
-  }
+function proxyProviderPolicy(provider, backendId) {
+  const measured = provider === LOCAL_PROVIDER ? localServerPolicy(localServerState())
+    : provider === LMSTUDIO_PROVIDER ? lmStudioModelPolicy(lmStudioServerState(), backendId)
+      : null;
+  if (measured) return measured;
   return {
     backend: provider,
     transport: 'proxy',
@@ -442,7 +461,7 @@ function resolveGatewayModelPolicy(id) {
   const provider = proxyModelProvider(backendId);
   const policy = (policyId !== 'default' && Object.hasOwn(MODEL_WINDOW_POLICY, policyId) ? MODEL_WINDOW_POLICY[policyId] : null)
     || (backendId.startsWith('gpt-') ? MODEL_WINDOW_POLICY.default : null)
-    || (provider ? proxyProviderPolicy(provider) : null)
+    || (provider ? proxyProviderPolicy(provider, backendId) : null)
     || (typeof id === 'string' && id.startsWith(PREFIX) && !id.startsWith(LEGACY_CODEX_PREFIX)
       ? MODEL_WINDOW_POLICY.anthropic
       : null);
@@ -749,7 +768,7 @@ module.exports = {
   STATIC_ENV_BLOCK, STABLE_COMMAND_PATH, TRACE_HEADERS, WIRING_CONFIG_PATH, WIN, CLI_PATH, CLAUDE_CONFIG_DIR, mkdirs,
   CAP_COMPACTION_MARGIN, CODEX_COMPACT_HEADROOM, CONTEXT_WINDOW_BACKENDS, CONTEXT_WINDOW_MAX, CONTEXT_WINDOW_MIN,
   CONTEXT_WINDOW_PATH, DEFAULT_CONTEXT_WINDOWS, COMPACT_AT_BACKENDS, gatewayCompactTrigger, codexBillingNote, contextWindowCap,
-  contextWindowCompactAt, effectiveSentryPolicy, LOCAL_MIN_SENTRY_WINDOW, localServerPolicy, parseCompactAtValue, sentryHeadroom,
+  contextWindowCompactAt, effectiveSentryPolicy, LOCAL_MIN_SENTRY_WINDOW, lmStudioModelPolicy, localServerPolicy, parseCompactAtValue, sentryHeadroom,
   parseContextWindowValue, readContextWindowSettings, writeContextWindowSettings,
   canReplaceInstalledCliPath, codexClientModelId, codexContextWindow, codexContextWindowModelId,
   codexReadinessMessage,

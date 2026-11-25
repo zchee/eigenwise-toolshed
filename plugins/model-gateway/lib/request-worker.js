@@ -24,6 +24,7 @@ const {
   setProxyModelRoutes,
 } = require('./proxy-models.js');
 const { refreshLocalServerState } = require('./local-llama.js');
+const { LMSTUDIO_PROVIDER, refreshLmStudioState } = require('./lmstudio.js');
 const { createAnthropicCatalog, advertisedAnthropicRows, withCachedAnthropicRows } = require('./anthropic-catalog.js');
 const { withPreviousServerRows } = require('./previous-picker-rows.js');
 const { ToolSchemaCompatibilityError, adaptCodexToolSchemas } = require('./tool-schema-compat.js');
@@ -268,6 +269,14 @@ const configuredSseHeartbeatSeconds = Number(process.env.CODEX_GATEWAY_SSE_HEART
 const SSE_HEARTBEAT_MS = Number.isFinite(configuredSseHeartbeatSeconds) && configuredSseHeartbeatSeconds >= 0
   ? configuredSseHeartbeatSeconds * 1000
   : 20000;
+// The longest an LM Studio stream's status line waits for the stream's first event, which is where
+// LM Studio reports a prompt that does not fit (see peekFirstSseEvent). The refusal comes as soon as
+// the prompt is tokenized; the bound is for a first frame that starts and then stalls, which gets
+// the stream heartbeat back once the stream is relayed.
+const configuredLmStudioFirstEventWaitMs = Number(process.env.CODEX_GATEWAY_LMSTUDIO_FIRST_EVENT_WAIT_MS);
+const LMSTUDIO_FIRST_EVENT_WAIT_MS = Number.isFinite(configuredLmStudioFirstEventWaitMs) && configuredLmStudioFirstEventWaitMs >= 0
+  ? configuredLmStudioFirstEventWaitMs
+  : 10000;
 const configuredWebSocketUpgradeRetries = Number(process.env.CODEX_GATEWAY_WS_UPGRADE_RETRIES);
 const WEBSOCKET_UPGRADE_RETRIES = Number.isInteger(configuredWebSocketUpgradeRetries) && configuredWebSocketUpgradeRetries >= 0
   ? configuredWebSocketUpgradeRetries
@@ -432,12 +441,108 @@ function upstreamTokenCounts(message) {
 // with HTTP 400, error.type exceed_context_size_error, and both counts as fields (n_prompt_tokens,
 // n_ctx). Its wording ("request (N tokens) exceeds the available context size (M tokens)") has no
 // "N tokens > M tokens" part, so the fields are the only exact numbers.
+//
+// LM Studio runs the same engine and wraps that refusal: its error.type is api_error and llama.cpp's
+// JSON is text inside error.message ("Engine protocol predict request returned 400: {...}"), as
+// LM Studio 0.4.28 sent it on 2026-11-25. The counts are read from the embedded JSON, or from the
+// wording when the text after the first brace is not JSON.
+function llamaOverflowCounts(error) {
+  const count = (value) => (Number.isSafeInteger(value) && value > 0 ? value : null);
+  if (error?.type === 'exceed_context_size_error') return { tokens: count(error.n_prompt_tokens), limitTokens: count(error.n_ctx) };
+  const message = typeof error?.message === 'string' ? error.message : '';
+  if (!message.includes('exceed_context_size_error')) return null;
+  let embedded = null;
+  try { embedded = JSON.parse(message.slice(message.indexOf('{')))?.error; } catch { /* worded only */ }
+  if (embedded?.type === 'exceed_context_size_error') return { tokens: count(embedded.n_prompt_tokens), limitTokens: count(embedded.n_ctx) };
+  const worded = /request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)/.exec(message);
+  return { tokens: count(Number(worded?.[1])), limitTokens: count(Number(worded?.[2])) };
+}
+
 function llamaContextOverflow(upstreamBody) {
   let error;
   try { error = JSON.parse(upstreamBody.toString())?.error; } catch { return null; }
-  if (error?.type !== 'exceed_context_size_error') return null;
-  const count = (value) => (Number.isSafeInteger(value) && value > 0 ? value : null);
-  return { tokens: count(error.n_prompt_tokens), limitTokens: count(error.n_ctx) };
+  return llamaOverflowCounts(error);
+}
+
+// LM Studio reports the whole prompt as input_tokens and the cached part of it again as
+// cache_read_input_tokens: the same 3013-token prompt came back as input 3013 with cache read 0,
+// then 3009, then 2497 after its tail changed (LM Studio 0.4.28, 2026-11-25). In the Messages API
+// the two add up, and both the sentry and Claude Code add them, so a cached session would count
+// nearly double. The cached part is taken out of input_tokens before anything reads the usage.
+// An input below its cache read cannot be an inclusive count and is left alone. Remove this if the
+// proxy or LM Studio starts reporting the Messages API's meaning, or it will undercount.
+function exclusiveLmStudioUsage(payload) {
+  const usage = payload?.type === 'message_start' ? payload.message?.usage : payload?.usage;
+  if (!usage || typeof usage !== 'object') return;
+  const { input_tokens: input, cache_read_input_tokens: cached } = usage;
+  if (Number.isFinite(input) && Number.isFinite(cached) && cached > 0 && input >= cached) usage.input_tokens = input - cached;
+}
+
+function exclusiveLmStudioJson(body) {
+  let parsed;
+  try { parsed = JSON.parse(body.toString()); } catch { return body; }
+  exclusiveLmStudioUsage(parsed);
+  return Buffer.from(JSON.stringify(parsed));
+}
+
+// The first event of an SSE stream that carries data: undefined while no such frame is complete,
+// null when its data is not JSON. Comment frames (pings) carry none and are passed over.
+function firstSseDataEvent(text) {
+  const frames = text.split(/\r?\n\r?\n/);
+  frames.pop();
+  for (const frame of frames) {
+    const data = frame.split(/\r?\n/).filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n');
+    if (!data) continue;
+    try { return JSON.parse(data); } catch { return null; }
+  }
+  return undefined;
+}
+
+// Reads an upstream stream up to its first data event without consuming it: the bytes read are put
+// back, so whoever attaches to the response next sees the stream from its first byte. LM Studio
+// answers a streaming request whose prompt does not fit with HTTP 200 and an error event as the
+// first frame, and that can only become a real 413 while no status line has gone to the client.
+// onEvent gets the event (null when the wait ran out, the stream ended first, or the frame was not
+// JSON); onFailure gets the telemetry status of an upstream that broke before any event.
+function peekFirstSseEvent(upRes, waitMs, onEvent, onFailure) {
+  const decoder = new StringDecoder('utf8');
+  const chunks = [];
+  let text = '';
+  let settled = false;
+  const settle = (deliver) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    upRes.removeListener('readable', onReadable);
+    upRes.removeListener('end', onEnd);
+    upRes.removeListener('error', onError);
+    upRes.removeListener('aborted', onAborted);
+    deliver();
+  };
+  // unshift is only legal before 'end' is emitted, which is why every path that hands the stream
+  // on does so from inside the 'readable' callback or the timer, never after 'end'.
+  const handOn = (event) => settle(() => {
+    if (chunks.length) upRes.unshift(Buffer.concat(chunks));
+    onEvent(event);
+    if (!upRes.destroyed) upRes.resume();
+  });
+  const onReadable = () => {
+    for (let chunk = upRes.read(); chunk !== null; chunk = upRes.read()) {
+      chunks.push(chunk);
+      text += decoder.write(chunk);
+    }
+    const event = firstSseDataEvent(text);
+    if (event !== undefined) handOn(event);
+    else if (upRes.complete) handOn(null);
+  };
+  const onEnd = () => settle(() => onFailure('upstream_error'));
+  const onError = () => settle(() => onFailure('upstream_error'));
+  const onAborted = () => settle(() => onFailure('upstream_aborted'));
+  const timer = setTimeout(() => handOn(null), waitMs);
+  upRes.on('readable', onReadable);
+  upRes.on('end', onEnd);
+  upRes.on('error', onError);
+  upRes.on('aborted', onAborted);
 }
 
 function sseErrorFrame(type, message) {
@@ -1316,10 +1421,15 @@ function runWorker() {
   }
 
   // claude-code-proxy releases before MIN_PROXY_VERSION signal overflow with their own non-413 shape,
-  // and its local provider passes llama-server's own 400 through unchanged.
+  // and its local and lmstudio providers pass the model server's own refusal through unchanged.
   function answerLegacyContextOverflow(upstreamBody, requestBody, sessionId, model, clientRes, routeTelemetry, upstreamStatus) {
     const llama = llamaContextOverflow(upstreamBody);
     if (!llama && !/context window|context length|input exceeds|prompt token count|too many tokens/i.test(upstreamBody.toString())) return false;
+    return answerContextOverflow(llama, requestBody, sessionId, model, clientRes, routeTelemetry, upstreamStatus);
+  }
+
+  // llama carries the engine's own counts when it reported them (llamaOverflowCounts), else null.
+  function answerContextOverflow(llama, requestBody, sessionId, model, clientRes, routeTelemetry, upstreamStatus) {
     const usage = SENTRY_ENABLED ? noteGenuineOverflow(sessionId, model, { learnCeiling: !llama?.limitTokens }) : 0;
     const limitTokens = llama?.limitTokens ?? codexContextWindow(model);
     const [tokens, tokensFrom] = llama?.tokens ? [llama.tokens, 'upstream'] : [usage, 'previous_turn_usage'];
@@ -1386,9 +1496,10 @@ function runWorker() {
       setProxyModelRoutes(routes.length ? routes : DEFAULT_MODELS.map((id) => ({ id, provider: 'codex' })));
     }
     routes = proxyModelRoutes();
-    // The local row's window is the n_ctx of the user's llama-server, read on every refresh so a
-    // server restarted with another context size is picked up within one refresh interval.
-    await refreshLocalServerState(routes, { fetchUrl });
+    // The local row's window is the n_ctx of the user's llama-server and an LM Studio row's the
+    // context its model is loaded with, both read on every refresh so a server restarted or a model
+    // reloaded with another context size is picked up within one refresh interval.
+    await Promise.all([refreshLocalServerState(routes, { fetchUrl }), refreshLmStudioState(routes, { fetchUrl })]);
     // Rows this plugin's Grok backend serves are listed from the Grok CLI below, not from the proxy.
     const proxyRows = advertisedProxyRoutes(routes).filter(({ id }) => resolveGatewayModelPolicy(id)?.transport === 'proxy');
     const grokModels = grokBackend.grokModelsFromCache();
@@ -1878,13 +1989,16 @@ function runWorker() {
       }
       if (advertisedModel && upRes.statusCode >= 200 && upRes.statusCode < 300) {
         delete resHeaders['content-length'];
-        if (streamedContentType) {
+        const relayStream = () => {
           if (!compactGuard?.headWritten) clientRes.writeHead(upRes.statusCode, resHeaders);
           if (compactGuard) compactGuard.headWritten = true;
           keepSseAlive(upRes, clientRes);
           const attempt = compactGuard ? newCompactAttempt() : null;
           const inference = attempt || newCompactAttempt();
           const observeEvent = (event) => {
+            // The transformer serializes this same object after observing it, so the client and
+            // the sentry read one corrected usage.
+            if (proxyProvider === LMSTUDIO_PROVIDER) exclusiveLmStudioUsage(event);
             noteCompactEvent(inference, event);
             inference.sentryUsage = mergeStreamUsage(inference.sentryUsage, event);
             if (filterPlanTools || (SENTRY_ENABLED && sessionId)) recordSentryUsage(sessionId, event, contextModel);
@@ -1978,6 +2092,23 @@ function runWorker() {
           upRes.on('end', () => settle());
           upRes.on('error', () => settle('upstream_error'));
           upRes.on('aborted', () => settle('upstream_aborted'));
+        };
+        if (streamedContentType) {
+          // A compaction retry has already sent its status line, so its stream has nothing to hold.
+          if (proxyProvider !== LMSTUDIO_PROVIDER || compactGuard?.headWritten) return relayStream();
+          peekFirstSseEvent(upRes, LMSTUDIO_FIRST_EVENT_WAIT_MS, (event) => {
+            const overflow = event?.type === 'error' ? llamaOverflowCounts(event.error) : null;
+            if (!overflow) return relayStream();
+            upRes.destroy();
+            answerContextOverflow(overflow, body, sessionId, contextModel, clientRes, routeTelemetry, upRes.statusCode);
+          }, (statusOverride) => {
+            routeTelemetry?.finish(upRes.statusCode, statusOverride);
+            clientRes.writeHead(502, { 'content-type': 'application/json' });
+            clientRes.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'api_error', message: 'model-gateway shim: upstream response ended early' },
+            }));
+          });
           return;
         }
         const chunks = [];
@@ -1991,7 +2122,7 @@ function runWorker() {
           clientRes.destroy();
         });
         upRes.on('end', () => {
-          const upstreamBody = Buffer.concat(chunks);
+          const upstreamBody = proxyProvider === LMSTUDIO_PROVIDER ? exclusiveLmStudioJson(Buffer.concat(chunks)) : Buffer.concat(chunks);
           usageCapture?.observeJson(upstreamBody);
           const completed = completedCodexJson(upstreamBody);
           if (completed) {

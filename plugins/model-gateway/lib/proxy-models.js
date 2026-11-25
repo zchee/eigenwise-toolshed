@@ -16,6 +16,7 @@ const PROVIDER_LABELS = Object.freeze({
   cursor: 'Cursor',
   grok: 'Grok',
   kimi: 'Kimi',
+  lmstudio: 'LM Studio',
   local: 'Local GGUF',
   muse: 'Muse',
   opencode: 'OpenCode',
@@ -98,6 +99,19 @@ function localServerState() {
   return localServer;
 }
 
+// claude-code-proxy's lmstudio provider forwards lmstudio/<model key> to LM Studio's local server.
+// A model's window is the context LM Studio loaded it with, so the last answer of that server
+// (lib/lmstudio.js) is kept here the same way. null means no probe has run in this process.
+let lmStudioServer = null;
+
+function setLmStudioServerState(state) {
+  lmStudioServer = state && typeof state === 'object' ? Object.freeze({ ...state }) : null;
+}
+
+function lmStudioServerState() {
+  return lmStudioServer;
+}
+
 // Codex ids stay routable with no listing at all, as they were before listings were read.
 function proxyModelProvider(backendId) {
   if (typeof backendId !== 'string' || !backendId) return null;
@@ -113,6 +127,7 @@ module.exports = {
   ANTHROPIC_STYLE_ALIAS_RE,
   CODEX_FAMILY_RE,
   advertisedProxyRoutes,
+  lmStudioServerState,
   localServerState,
   modelsFileRoutes,
   parseProxyModelListing,
@@ -120,6 +135,7 @@ module.exports = {
   proxyModelDisplayName,
   proxyModelProvider,
   proxyModelRoutes,
+  setLmStudioServerState,
   setLocalServerState,
   setProxyModelRoutes,
 };

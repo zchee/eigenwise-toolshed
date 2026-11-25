@@ -291,6 +291,8 @@ test('Vertex AI policy rows carry each documented window above 200k and leave th
   const tests = {
     'Gemini under its bare id': { backendId: 'gemini-4-argon', backendWindow: 1048576, advertised: 1000000 },
     'Gemini under its vertex/ id': { backendId: 'vertex/gemini-3.5-flash-lite', backendWindow: 1048576, advertised: 1000000 },
+    'Gemini registered after the first catalog date': { backendId: 'gemini-4-hydrogen', backendWindow: 1048576, advertised: 1000000, measuredOn: '2026-11-25' },
+    'the same, under its vertex/ id': { backendId: 'vertex/gemini-4-neon', backendWindow: 1048576, advertised: 1000000, measuredOn: '2026-11-25' },
     // Claude Code takes any id containing claude-fable- for its own Fable, so this row's picker id
     // spells the model fable-; the proxy still gets the id it listed.
     'Claude on Vertex': { backendId: 'vertex/anthropic/claude-fable-5-2', pickerId: 'vertex/anthropic/fable-5-2', backendWindow: 1000000, advertised: 1000000 },
@@ -303,7 +305,7 @@ test('Vertex AI policy rows carry each documented window above 200k and leave th
     'Llama 4 Maverick': { backendId: 'vertex/meta/llama-4-maverick-17b-128e-instruct-maas', backendWindow: 524288, advertised: 524288 },
     'Llama 4 Scout': { backendId: 'vertex/meta/llama-4-scout-17b-16e-instruct-maas', backendWindow: 1310720, advertised: 1000000 },
   };
-  for (const [name, { backendId, pickerId = backendId, backendWindow, advertised }] of Object.entries(tests)) {
+  for (const [name, { backendId, pickerId = backendId, backendWindow, advertised, measuredOn = '2026-11-12' }] of Object.entries(tests)) {
     const policy = resolveGatewayModelPolicy(`claude-${pickerId}[1m]`);
     assert.equal(policy.backend, 'vertex', name);
     assert.equal(policy.transport, 'proxy', `${name}: only claude-code-proxy serves Vertex AI`);
@@ -311,24 +313,25 @@ test('Vertex AI policy rows carry each documented window above 200k and leave th
     assert.equal(policy.backendWindow, backendWindow, name);
     assert.equal(policy.pickerAlias, `claude-${pickerId}[1m]`, name);
     assert.equal(policy.sentry, 'synthetic-413', name);
-    assert.match(policy.measurement, /\b2026-11-12\b.*; not a live probe$/, `${name}: the row names its dated source`);
+    assert.match(policy.measurement, new RegExp(`\\b${measuredOn}\\b.*; not a live probe$`), `${name}: the row names its dated source`);
     assert.equal(gatewayClientModelId(backendId), `claude-${pickerId}[1m]`, `${name}: a window above 200k takes the [1m] alias`);
     assert.equal(gatewayModel(backendId, 'vertex').max_input_tokens, advertised, `${name}: never advertised above the [1m] client window`);
     assert.equal(effectiveSentryPolicy(policy).compactTrigger, backendWindow - 40000, `${name}: the sentry keeps one turn of headroom`);
   }
 
-  // Every name claude-code-proxy's vertex provider lists at dev c31326c with no deployed endpoint
+  // Every name claude-code-proxy's vertex provider lists at dev ef6b0bc with no deployed endpoint
   // configured, copied from its /v1/models. A row whose id is not one of these could never match
   // a listed model, and a registered model missing below would silently stay a 200k row.
   const registered = [
     'gemini-3-flash-preview', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.7-flash',
-    'gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon', 'vertex/anthropic/claude-fable-5', 'vertex/anthropic/claude-fable-5-1',
+    'gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-neon', 'vertex/anthropic/claude-fable-5', 'vertex/anthropic/claude-fable-5-1',
     'vertex/anthropic/claude-fable-5-2', 'vertex/anthropic/claude-haiku-4-5@20251001', 'vertex/anthropic/claude-haiku-5-5',
     'vertex/anthropic/claude-opus-4-5@20251101', 'vertex/anthropic/claude-opus-4-6', 'vertex/anthropic/claude-opus-4-7',
     'vertex/anthropic/claude-opus-4-8', 'vertex/anthropic/claude-opus-5', 'vertex/anthropic/claude-opus-5-5', 'vertex/anthropic/claude-sonnet-4-6',
     'vertex/anthropic/claude-sonnet-5', 'vertex/anthropic/claude-sonnet-5-5', 'vertex/deepseek-ai/deepseek-v4.1-flash-maas',
     'vertex/gemini-3-flash-preview', 'vertex/gemini-3.1-flash-lite', 'vertex/gemini-3.1-pro-preview', 'vertex/gemini-3.5-flash',
     'vertex/gemini-3.5-flash-lite', 'vertex/gemini-3.7-flash', 'vertex/gemini-3.8-flash', 'vertex/gemini-4-argon', 'vertex/gemini-4-carbon',
+    'vertex/gemini-4-hydrogen', 'vertex/gemini-4-neon',
     'vertex/google/gemma-4-26b-a4b-it-maas', 'vertex/meta/llama-4-maverick-17b-128e-instruct-maas', 'vertex/meta/llama-4-scout-17b-16e-instruct-maas',
     'vertex/meta/muse-ember-1.0', 'vertex/meta/muse-spark-1.3', 'vertex/meta/muse-wonder-1.0', 'vertex/mistralai/codestral-2',
     'vertex/mistralai/mistral-medium-3', 'vertex/mistralai/mistral-small-2503', 'vertex/openai/gpt-6-astra', 'vertex/openai/gpt-6-luna',
@@ -337,7 +340,7 @@ test('Vertex AI policy rows carry each documented window above 200k and leave th
   ];
   const gemini = [
     'gemini-3-flash-preview', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3.5-flash', 'gemini-3.5-flash-lite',
-    'gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon',
+    'gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-neon',
   ];
   const documentedWindows = {
     1048576: [...gemini, ...gemini.map((id) => `vertex/${id}`), 'vertex/meta/muse-ember-1.0', 'vertex/meta/muse-spark-1.3', 'vertex/meta/muse-wonder-1.0'],
@@ -362,11 +365,11 @@ test('Vertex AI policy rows carry each documented window above 200k and leave th
     vertexRows.map((policy) => [policy.backendId, policy.backendWindow]).sort(([left], [right]) => (left < right ? -1 : 1)),
     expectedRows,
   );
-  assert.equal(vertexRows.length, 45);
+  assert.equal(vertexRows.length, 49);
   assert.deepEqual(expectedRows.map(([id]) => id).filter((id) => !registered.includes(id)), [], 'every row is a name the proxy registers');
   // The proxy lists every registered Gemini model twice; both spellings are one model with one window.
   const bareGeminiIds = vertexRows.map((policy) => policy.backendId).filter((id) => !id.includes('/'));
-  assert.equal(bareGeminiIds.length, 9);
+  assert.equal(bareGeminiIds.length, 11);
   for (const id of bareGeminiIds) {
     const { backendId, pickerAlias, ...shared } = MODEL_WINDOW_POLICY[id];
     const { backendId: prefixedId, pickerAlias: prefixedAlias, ...prefixed } = MODEL_WINDOW_POLICY[`vertex/${id}`];

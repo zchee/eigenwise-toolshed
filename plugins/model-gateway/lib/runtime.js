@@ -64,13 +64,13 @@ const PICKER_ALIAS_CLIENT_WINDOW = 1000000;
 // (vertex/endpoint/<name>) serves whatever its owner deployed, so all of those stay unmeasured
 // 200000 rows. transport is explicit so a request is forwarded to the proxy and doctor does not
 // expect these rows when no live listing proves the proxy serves them.
-const VERTEX_GEMINI_IDS = Object.freeze([
-  'gemini-4-argon', 'gemini-4-carbon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash',
-  'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview',
-]);
+const vertexGeminiSpellings = (ids) => ids.flatMap((id) => [id, `vertex/${id}`]);
 const VERTEX_WINDOW_EVIDENCE = Object.freeze([
   ['models.dev google-vertex 2026-11-12', [
-    [1048576, VERTEX_GEMINI_IDS.flatMap((id) => [id, `vertex/${id}`])],
+    [1048576, vertexGeminiSpellings([
+      'gemini-4-argon', 'gemini-4-carbon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash',
+      'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview',
+    ])],
     [1000000, [
       'claude-fable-5-2', 'claude-fable-5-1', 'claude-fable-5', 'claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-8',
       'claude-opus-4-7', 'claude-sonnet-5-5', 'claude-sonnet-5', 'claude-haiku-5-5', 'claude-opus-4-6', 'claude-sonnet-4-6',
@@ -81,6 +81,10 @@ const VERTEX_WINDOW_EVIDENCE = Object.freeze([
     [262144, ['vertex/google/gemma-4-26b-a4b-it-maas']],
     [524288, ['vertex/meta/llama-4-maverick-17b-128e-instruct-maas']],
     [1310720, ['vertex/meta/llama-4-scout-17b-16e-instruct-maas']],
+  ]],
+  // claude-code-proxy registered these two at dev ef6b0bc, after the catalog date above.
+  ['models.dev google-vertex 2026-11-25', [
+    [1048576, vertexGeminiSpellings(['gemini-4-hydrogen', 'gemini-4-neon'])],
   ]],
   ['claude-code-proxy dev c31326c 2026-11-12 docs/providers/vertex.md, quoting Google\'s input limit', [
     [922000, ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-luna'].map((id) => `vertex/openai/${id}`)],

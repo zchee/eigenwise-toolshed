@@ -1,12 +1,12 @@
 # Directory structure
 
-Last Updated: 2026-10-18
+Last Updated: 2026-11-25
 
 - `.claude/`: project settings, live rules, and generated codebase map.
 - `.claude-plugin/`: marketplace manifest and published plugin entries.
 - `plugins/sidequest/`: board engine, MCP server, CLI, hooks, dashboard, tests, committed build output, and bundled stable executor agents under `agents/`. Pure lifecycle and worktree decisions live in `src/lib/kernel/`; persistence is split under `src/lib/store/`, with matching compiled modules under `lib/`. `scripts/generate-bundled-agents.mjs` derives the packaged agent markdown from `lib/agentsync.js`. `plugins/sidequest/scripts/owned-process-tree.js` and `plugins/sidequest/scripts/owned-phase-supervisor.js` keep test and release subprocess ownership explicit through cleanup.
 - `plugins/observability/`: the hooks module (`hooks/register.ts`, `hooks/ledger.ts`, `types/index.d.ts`), the board generator `lib/board.mjs`, the `track` skill, and node tests plus `*.test.ts` for `claude plugin test`.
-- `plugins/model-gateway/`: local model gateway CLI, registry hook, skills, and tests; `lib/` holds the shim/worker runtime, the per-model policy table, the claude-code-proxy model-listing route table (`proxy-models.js`), process supervision, the Windows detached launcher, lifecycle diagnostics, cache-sibling identity checks, bounded owner resolution, and full-width POSIX process probes.
+- `plugins/model-gateway/`: local model gateway CLI, registry hook, skills, and tests; `lib/` holds the shim/worker runtime, the per-model policy table, the claude-code-proxy model-listing route table (`proxy-models.js`), the readers of the proxy's own settings and of the model servers it forwards to (`proxy-config.js`, `local-llama.js`, `lmstudio.js`), process supervision, the Windows detached launcher, lifecycle diagnostics, cache-sibling identity checks, bounded owner resolution, and full-width POSIX process probes.
 - `plugins/live-rules/`: rule-management skills and prompt/edit/session hooks.
 - `plugins/codebase-mapper/`: map-generation/update skills and context injection hooks.
 - `plugins/quartermaster/`: workspace setup and resupply skills, updater and health-check skills, transcript miner CLI, and project settings support. Quality scoring delegates to Quality Gate; setup no longer seeds a clean-code baseline.

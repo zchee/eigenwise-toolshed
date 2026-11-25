@@ -5,7 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 const grokBackend = require('./grok-backend.js');
 const { writeFileAtomically } = require('./atomic-file.js');
-const { CODEX_FAMILY_RE, proxyModelProvider } = require('./proxy-models.js');
+const { CODEX_FAMILY_RE, localServerState, proxyModelProvider } = require('./proxy-models.js');
+const { LOCAL_PROVIDER } = require('./local-llama.js');
 
 const WIN = process.platform === 'win32';
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
@@ -333,9 +334,15 @@ function gatewayCompactionCandidates(compactTrigger, cap, compactAt) {
   return triggers;
 }
 
+// Rows measured against a fixed backend keep the 40000-token reserve. A row whose window is set by
+// the user's own server (the local llama-server row) carries a reserve scaled to that window.
+function sentryHeadroom(policy) {
+  return Number.isSafeInteger(policy?.compactHeadroom) && policy.compactHeadroom > 0 ? policy.compactHeadroom : CODEX_COMPACT_HEADROOM;
+}
+
 function sentryBackendWindow(policy) {
   const backendWindow = policy.backendWindow;
-  if (!Number.isFinite(backendWindow) || backendWindow <= CODEX_COMPACT_HEADROOM) {
+  if (!Number.isFinite(backendWindow) || backendWindow <= sentryHeadroom(policy)) {
     throw new Error(`model-gateway: invalid sentry backend window for ${policy.backendId}`);
   }
   return backendWindow;
@@ -344,7 +351,7 @@ function sentryBackendWindow(policy) {
 function effectiveSentryPolicy(policy, compactTrigger = configuredCompactTrigger, cap = contextWindowCap(policy?.backend), compactAt = contextWindowCompactAt(policy?.backend)) {
   if (policy?.sentry !== 'synthetic-413') return null;
   const backendWindow = sentryBackendWindow(policy);
-  const triggers = [{ compactTrigger: backendWindow - CODEX_COMPACT_HEADROOM, source: 'derived' },
+  const triggers = [{ compactTrigger: backendWindow - sentryHeadroom(policy), source: 'derived' },
     ...gatewayCompactionCandidates(compactTrigger, cap, compactAt)];
   const [lowest] = triggers.sort((left, right) => left.compactTrigger - right.compactTrigger);
   return { backendWindow, ...lowest };
@@ -371,10 +378,44 @@ function codexContextWindowModelId(id) {
   return baseId || 'default';
 }
 
+// The local row's window is the n_ctx of the llama-server the user started, read live from its
+// /props. Claude Code's own first request measured 12732 tokens on 2026-11-25 (Claude Code 2.1.332,
+// no MCP servers, Qwen3 tokenizer through llama-server b12110). The sentry keeps a third of the
+// window (at most the usual 40000) for the turn that crosses the trigger, the compaction prompt and
+// the summary, because the compaction request resends the whole conversation to the same server.
+// Below 32768 the trigger would sit within a few thousand tokens of that first request, so such a
+// row gets no sentry; doctor reports it and an overflow still comes back as a 413.
+const LOCAL_MIN_SENTRY_WINDOW = 32768;
+
+function localCompactHeadroom(window) {
+  return Math.min(CODEX_COMPACT_HEADROOM, Math.floor(window / 3));
+}
+
+function localServerPolicy(state) {
+  const backendWindow = state?.contextWindow;
+  if (!Number.isSafeInteger(backendWindow) || backendWindow <= 0) return null;
+  const guarded = backendWindow >= LOCAL_MIN_SENTRY_WINDOW;
+  return {
+    backend: LOCAL_PROVIDER,
+    transport: 'proxy',
+    backendId: null,
+    backendWindow,
+    measurement: `llama-server /props n_ctx ${backendWindow} on 127.0.0.1:${state.port}, read live`,
+    pickerAliasTemplate: 'claude-{backendId}[1m]',
+    advertisedWindow: Math.min(backendWindow, PICKER_ALIAS_CLIENT_WINDOW),
+    ...(guarded ? { compactHeadroom: localCompactHeadroom(backendWindow) } : {}),
+    sentry: guarded ? 'synthetic-413' : 'none',
+  };
+}
+
 // claude-code-proxy providers other than Codex publish no context window, and the table above
 // admits only measured rows. Advertising Claude Code's own unknown-model window keeps the client
 // compacting well before a smaller backend limit; a real overflow still comes back as a 413.
 function proxyProviderPolicy(provider) {
+  if (provider === LOCAL_PROVIDER) {
+    const measured = localServerPolicy(localServerState());
+    if (measured) return measured;
+  }
   return {
     backend: provider,
     transport: 'proxy',
@@ -708,7 +749,7 @@ module.exports = {
   STATIC_ENV_BLOCK, STABLE_COMMAND_PATH, TRACE_HEADERS, WIRING_CONFIG_PATH, WIN, CLI_PATH, CLAUDE_CONFIG_DIR, mkdirs,
   CAP_COMPACTION_MARGIN, CODEX_COMPACT_HEADROOM, CONTEXT_WINDOW_BACKENDS, CONTEXT_WINDOW_MAX, CONTEXT_WINDOW_MIN,
   CONTEXT_WINDOW_PATH, DEFAULT_CONTEXT_WINDOWS, COMPACT_AT_BACKENDS, gatewayCompactTrigger, codexBillingNote, contextWindowCap,
-  contextWindowCompactAt, effectiveSentryPolicy, parseCompactAtValue,
+  contextWindowCompactAt, effectiveSentryPolicy, LOCAL_MIN_SENTRY_WINDOW, localServerPolicy, parseCompactAtValue, sentryHeadroom,
   parseContextWindowValue, readContextWindowSettings, writeContextWindowSettings,
   canReplaceInstalledCliPath, codexClientModelId, codexContextWindow, codexContextWindowModelId,
   codexReadinessMessage,

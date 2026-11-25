@@ -20,8 +20,10 @@ const { effectiveBaseUrl, wiredMode } = require('./settings-wiring.js');
 const { detectHostsCompat } = require('./remote-control.js');
 const { ourBaseUrls, proxyRouteFromId } = require('./pins.js');
 const {
-  advertisedProxyRoutes, modelsFileRoutes, parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes, setProxyModelRoutes,
+  advertisedProxyRoutes, modelsFileRoutes, parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes,
+  setProxyModelRoutes,
 } = require('./proxy-models.js');
+const { refreshLocalServerState } = require('./local-llama.js');
 const { createAnthropicCatalog, advertisedAnthropicRows, withCachedAnthropicRows } = require('./anthropic-catalog.js');
 const { withPreviousServerRows } = require('./previous-picker-rows.js');
 const { ToolSchemaCompatibilityError, adaptCodexToolSchemas } = require('./tool-schema-compat.js');
@@ -36,7 +38,7 @@ const {
   REQUEST_ROUTE_LOG_PATH, ROUTE_TELEMETRY_ENABLED, ROUTE_TELEMETRY_TIMEOUT_MS, SHIM_PORT, SOCKET_PATH,
   MODEL_WINDOW_POLICY, STATE, syncGatewayDiscoveryCache, TRACE_HEADERS,
   codexContextWindow, codexContextWindowModelId, codexReadinessMessage, gatewayAdvertisedWindow, gatewayClientModelId, mkdirs,
-  resolveGatewayModelPolicy, CODEX_COMPACT_HEADROOM, effectiveSentryPolicy,
+  resolveGatewayModelPolicy, CODEX_COMPACT_HEADROOM, effectiveSentryPolicy, sentryHeadroom,
 } = require('./runtime.js');
 
 const execFileAsync = promisify(execFile);
@@ -335,6 +337,15 @@ function sentryInputTokens(usage) {
     .reduce((total, field) => total + (Number.isFinite(usage?.[field]) ? usage[field] : 0), 0);
 }
 
+// A stream's usage so far. message_delta usage is cumulative and a field it leaves out keeps its
+// earlier value, so a later event overrides only the fields it carries. llama-server (behind the
+// proxy's local provider) reports the input counts only in message_start's message.usage and sends
+// message_delta with output_tokens alone; without the merge the turn's input never reached the sentry.
+function mergeStreamUsage(previous, event) {
+  const usage = event?.type === 'message_start' ? event.message?.usage : event?.usage;
+  return usage && typeof usage === 'object' ? { ...previous, ...usage } : previous;
+}
+
 function sentryUsageRearms(usage, compactTrigger, ordinaryTurnCompleted) {
   const lowWatermark = compactTrigger - Math.min(CODEX_COMPACT_HEADROOM, compactTrigger * 0.25);
   return usage < lowWatermark || (ordinaryTurnCompleted && usage > compactTrigger);
@@ -415,6 +426,18 @@ function parsedRequestTooLarge(upstreamBody) {
 function upstreamTokenCounts(message) {
   const counts = /(\d+)\s+tokens\s*>\s*(\d+)\s+tokens/i.exec(message);
   return counts && { tokens: Number(counts[1]), limitTokens: Number(counts[2]) };
+}
+
+// llama-server, behind claude-code-proxy's local provider, refuses a prompt longer than its context
+// with HTTP 400, error.type exceed_context_size_error, and both counts as fields (n_prompt_tokens,
+// n_ctx). Its wording ("request (N tokens) exceeds the available context size (M tokens)") has no
+// "N tokens > M tokens" part, so the fields are the only exact numbers.
+function llamaContextOverflow(upstreamBody) {
+  let error;
+  try { error = JSON.parse(upstreamBody.toString())?.error; } catch { return null; }
+  if (error?.type !== 'exceed_context_size_error') return null;
+  const count = (value) => (Number.isSafeInteger(value) && value > 0 ? value : null);
+  return { tokens: count(error.n_prompt_tokens), limitTokens: count(error.n_ctx) };
 }
 
 function sseErrorFrame(type, message) {
@@ -1176,9 +1199,11 @@ function runWorker() {
   function sentryModel(model) {
     const modelId = codexContextWindowModelId(model);
     let state = sentryModels.get(modelId);
-    if (!state) {
-      const sentryPolicy = sentryPolicyFor(model);
-      if (!sentryPolicy) throw new Error(`model-gateway: no sentry policy for ${modelId}`);
+    const sentryPolicy = sentryPolicyFor(model);
+    if (!sentryPolicy) throw new Error(`model-gateway: no sentry policy for ${modelId}`);
+    // A local llama-server restarted with another context size changes its row's window; the trigger
+    // and any ceiling observed against the old window no longer apply.
+    if (!state || state.backendWindow !== sentryPolicy.backendWindow) {
       state = { ...sentryPolicy, observedCeiling: null };
       sentryModels.set(modelId, state);
     }
@@ -1246,17 +1271,21 @@ function runWorker() {
     return true;
   }
 
-  function noteGenuineOverflow(sessionId, model) {
+  // learnCeiling is false when the backend reported its exact limit (llama-server's n_ctx): the
+  // previous turn's usage is then no estimate of the ceiling, and learning it would pull the trigger
+  // below Claude Code's own first request on a small window.
+  function noteGenuineOverflow(sessionId, model, { learnCeiling = true } = {}) {
     const state = sentrySession(sessionId, model);
     const usage = state?.usage || 0;
     if (state) state.fired = true;
     if (!sentryPolicyFor(model)) return usage;
     const modelState = sentryModel(model);
-    if (modelState.source === 'derived' && usage > CODEX_COMPACT_HEADROOM) {
+    const headroom = sentryHeadroom(resolveGatewayModelPolicy(model));
+    if (learnCeiling && modelState.source === 'derived' && usage > headroom) {
       modelState.observedCeiling = modelState.observedCeiling == null
         ? usage
         : Math.min(modelState.observedCeiling, usage);
-      modelState.compactTrigger = Math.max(1, modelState.observedCeiling - CODEX_COMPACT_HEADROOM);
+      modelState.compactTrigger = Math.max(1, modelState.observedCeiling - headroom);
     }
     return usage;
   }
@@ -1286,13 +1315,16 @@ function runWorker() {
     clientRes.end(responseBody);
   }
 
-  // claude-code-proxy releases before MIN_PROXY_VERSION signal overflow with their own non-413 shape.
+  // claude-code-proxy releases before MIN_PROXY_VERSION signal overflow with their own non-413 shape,
+  // and its local provider passes llama-server's own 400 through unchanged.
   function answerLegacyContextOverflow(upstreamBody, requestBody, sessionId, model, clientRes, routeTelemetry, upstreamStatus) {
-    if (!/context window|context length|input exceeds|prompt token count|too many tokens/i.test(upstreamBody.toString())) return false;
-    const usage = SENTRY_ENABLED ? noteGenuineOverflow(sessionId, model) : 0;
-    const limitTokens = codexContextWindow(model);
-    const numbers = SENTRY_ENABLED ? ` (${usage || limitTokens + 1} tokens > ${limitTokens} tokens)` : '';
-    const overflow = contextOverflowDetails(requestBody, 'upstream', usage, 'previous_turn_usage', limitTokens);
+    const llama = llamaContextOverflow(upstreamBody);
+    if (!llama && !/context window|context length|input exceeds|prompt token count|too many tokens/i.test(upstreamBody.toString())) return false;
+    const usage = SENTRY_ENABLED ? noteGenuineOverflow(sessionId, model, { learnCeiling: !llama?.limitTokens }) : 0;
+    const limitTokens = llama?.limitTokens ?? codexContextWindow(model);
+    const [tokens, tokensFrom] = llama?.tokens ? [llama.tokens, 'upstream'] : [usage, 'previous_turn_usage'];
+    const numbers = (llama?.tokens || SENTRY_ENABLED) ? ` (${tokens || limitTokens + 1} tokens > ${limitTokens} tokens)` : '';
+    const overflow = contextOverflowDetails(requestBody, 'upstream', tokens, tokensFrom, limitTokens);
     const normalized = contextOverflowBody(`Input exceeds the model context window; compact and retry.${numbers}`, overflow);
     routeTelemetry.setOverflow(overflow);
     routeTelemetry.finish(413);
@@ -1354,6 +1386,9 @@ function runWorker() {
       setProxyModelRoutes(routes.length ? routes : DEFAULT_MODELS.map((id) => ({ id, provider: 'codex' })));
     }
     routes = proxyModelRoutes();
+    // The local row's window is the n_ctx of the user's llama-server, read on every refresh so a
+    // server restarted with another context size is picked up within one refresh interval.
+    await refreshLocalServerState(routes, { fetchUrl });
     // Rows this plugin's Grok backend serves are listed from the Grok CLI below, not from the proxy.
     const proxyRows = advertisedProxyRoutes(routes).filter(({ id }) => resolveGatewayModelPolicy(id)?.transport === 'proxy');
     const grokModels = grokBackend.grokModelsFromCache();
@@ -1851,7 +1886,7 @@ function runWorker() {
           const inference = attempt || newCompactAttempt();
           const observeEvent = (event) => {
             noteCompactEvent(inference, event);
-            inference.sentryUsage = event.usage ?? inference.sentryUsage;
+            inference.sentryUsage = mergeStreamUsage(inference.sentryUsage, event);
             if (filterPlanTools || (SENTRY_ENABLED && sessionId)) recordSentryUsage(sessionId, event, contextModel);
             usageCapture?.observeEvent(event);
           };

@@ -47,15 +47,16 @@ const { fetchLatestRelease } = require('./github-release.js');
 const { createGatewayUsageEmitter, recordRequestBodyHighWater } = require('./usage-observability.js');
 const grokBackend = require('./grok-backend.js');
 const {
-  parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes, setProxyModelRoutes,
+  localServerState, parseProxyModelListing, providerLabel, proxyModelDisplayName, proxyModelRoutes, setProxyModelRoutes,
 } = require('./proxy-models.js');
+const { LLAMA_PORT_ENV, LOCAL_PROVIDER, llamaServerPort, refreshLocalServerState } = require('./local-llama.js');
 const {
   canReplaceInstalledCliPath, CLI_PATH, GATEWAY_MODELS_CACHE, MODEL_WINDOW_POLICY, resolveStableCommandPath,
   gatewayAdvertisedWindow, gatewayClientModelId, gatewayDiscoveryModels, readGatewayDiscoveryCache,
   readInstalledPluginEntries,
   resolveGatewayModelPolicy, sameGatewayDiscoveryModels, SOCKET_PATH, resolveNewestInstalledCliPath,
   syncGatewayDiscoveryCache, CONTEXT_WINDOW_PATH, contextWindowCap, contextWindowCompactAt, readContextWindowSettings,
-  writeContextWindowSettings,
+  writeContextWindowSettings, LOCAL_MIN_SENTRY_WINDOW,
 } = require('./runtime.js');
 const {
   contextWindowReport, contextWindowUpdate, gatewayWindowNote, savedContextWindows, saveContextWindowUpdate, syncClaudeContextWindow,
@@ -1263,6 +1264,7 @@ function windowValue(value) {
 function evidenceDate(measurement) {
   const date = String(measurement || '').match(/\b\d{4}-\d{2}-\d{2}\b/);
   if (date) return date[0];
+  if (String(measurement || '').endsWith('read live')) return 'live';
   return String(measurement || '').startsWith('unmeasured') ? 'unmeasured' : 'upstream-managed';
 }
 
@@ -1406,7 +1408,12 @@ async function doctor({ readiness: suppliedReadiness = null } = {}) {
   if (readiness.checks.proxyBinary && await loadProxyModelRoutes()) {
     const providers = [...new Set(proxyModelRoutes().map((route) => route.provider))].filter((provider) => provider !== 'codex');
     for (const provider of providers) {
-      log(`proxy ${provider} auth: ${describeProxyProviderAuth(provider, proxyProviderAuthState(provider))}`);
+      const subject = provider === LOCAL_PROVIDER ? 'server' : 'auth';
+      log(`proxy ${provider} ${subject}: ${describeProxyProviderAuth(provider, proxyProviderAuthState(provider))}`);
+      if (provider === LOCAL_PROVIDER) {
+        const mismatch = localWindowMismatch(await fetchShimModels().catch(() => []));
+        if (mismatch) log(`proxy local window: ${mismatch}`);
+      }
     }
   }
   const status = await statusReport({ readiness });
@@ -1679,10 +1686,59 @@ function proxyProviderAuthState(provider, { run = spawnSync, env = process.env, 
     return typeof apiKey === 'string' && apiKey ? 'ready' : 'auth-missing';
   }
   if (provider === 'vertex' && !vertexProjectIsSet(env, configDirectory)) return 'config-invalid';
+  if (provider === LOCAL_PROVIDER) return localServerReadinessState(env, localServerState());
   const result = run(PROXY_BIN, [provider, 'auth', 'status'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
   if (result.status === 0) return 'ready';
   if (result.status === 1) return 'auth-missing';
   return provider === 'vertex' && result.status === 2 ? 'config-invalid' : 'auth-unknown';
+}
+
+// The local provider has no sign-in and the proxy no `local` CLI group: its readiness is whether the
+// llama-server named by CCP_LLAMA_PORT answered the last probe (loadProxyModelRoutes runs it). The
+// variable is read from this process's environment, which is the gateway's when the gateway runs
+// this, and the proxy inherits the gateway's.
+// doctor probes llama-server from its own environment, the running gateway from the gateway's. When
+// the two windows differ, CCP_LLAMA_PORT differs between them, and the catalog this process writes
+// disagrees with what the gateway serves.
+function localWindowMismatch(shimModels, state = localServerState()) {
+  const row = shimModels.find((model) => typeof model?.id === 'string' && model.id.startsWith('claude-local/gguf'));
+  if (!row || !Number.isSafeInteger(row.max_input_tokens)) return null;
+  const here = gatewayAdvertisedWindow('claude-local/gguf');
+  if (row.max_input_tokens === here) return null;
+  return `MISMATCH: the running gateway advertises ${row.max_input_tokens} tokens but this process measured ${state?.contextWindow ? `${state.contextWindow} tokens` : 'no window'}; ${LLAMA_PORT_ENV} is ${llamaServerPort().port ?? 'unset or not a port'} here, so it likely differs from the gateway's environment. Run doctor where the gateway starts, or set the same ${LLAMA_PORT_ENV} in both.`;
+}
+
+function localServerReadinessState(env, state) {
+  const { port } = llamaServerPort(env);
+  if (port === null) return 'config-invalid';
+  if (!state || state.port !== port) return 'auth-unknown';
+  return state.reachable ? 'ready' : 'backend-down';
+}
+
+function localServerRestartHint() {
+  const stable = resolveStableCommandPath();
+  return `\`node "${stable}" stop\`, then \`node "${stable}" start\``;
+}
+
+// What the local provider's states mean; they replace the sign-in wording the other providers use.
+const LOCAL_SERVER_READINESS_REASONS = {
+  'config-invalid': (env) => {
+    const { invalid } = llamaServerPort(env);
+    const problem = invalid === undefined ? `${LLAMA_PORT_ENV} is not set` : `${LLAMA_PORT_ENV}=${JSON.stringify(invalid)} is not a port`;
+    return `claude-code-proxy lists local/gguf, but ${problem} where the gateway runs, so the gateway cannot reach the llama-server behind it. Set ${LLAMA_PORT_ENV} to llama-server's --port where the gateway starts (the proxy inherits the gateway's environment), then restart the gateway: ${localServerRestartHint()}.`;
+  },
+  'backend-down': (env) => {
+    const state = localServerState();
+    const port = state?.port ?? llamaServerPort(env).port;
+    return `llama-server is not answering on 127.0.0.1:${port}${state?.error ? ` (${state.error})` : ''}. Start it with \`llama-server -m <model>.gguf --jinja --host 127.0.0.1 --port ${port}\`.`;
+  },
+  'auth-unknown': () => 'the llama-server behind local/gguf has not been probed in this process yet.',
+};
+
+// env is the environment the state was decided from, so the explanation names the same value.
+function proxyProviderReason(state, provider, label, env = process.env) {
+  const local = provider === LOCAL_PROVIDER ? LOCAL_SERVER_READINESS_REASONS[state] : undefined;
+  return local ? local(env) : PROXY_PROVIDER_READINESS_REASONS[state]?.(provider, label);
 }
 
 // Providers the proxy signs in to itself take `<provider> auth login`; these two do not.
@@ -1705,13 +1761,27 @@ const PROXY_PROVIDER_READINESS_REASONS = {
 // What a provider's `ready` state proved about its credentials.
 function proxyProviderCredentialCheck(provider) {
   if (provider === 'opencode') return 'API key presence';
+  if (provider === LOCAL_PROVIDER) return 'llama-server reachability';
   return provider === 'vertex' ? 'Google credentials and Vertex settings' : 'authentication';
 }
 
 // The `proxy <provider> auth:` value doctor prints for a provider's auth state.
-function describeProxyProviderAuth(provider, state) {
-  if (state === 'ready') return provider === 'opencode' ? 'API key present' : 'authenticated';
-  const reason = PROXY_PROVIDER_READINESS_REASONS[state]?.(provider, providerLabel(provider));
+function describeLocalServer(state = localServerState()) {
+  const window = state?.contextWindow;
+  const context = window ? `context ${window} tokens` : 'context unknown (/props reported no n_ctx, as in router mode), so the row is an unmeasured 200k row';
+  const small = window && window < LOCAL_MIN_SENTRY_WINDOW
+    ? `; WARNING: below ${LOCAL_MIN_SENTRY_WINDOW}, so there is no compaction sentry and Claude Code's own first request (about 13k tokens) leaves little room: restart llama-server with -c ${LOCAL_MIN_SENTRY_WINDOW} or more`
+    : '';
+  return `llama-server answering on 127.0.0.1:${state?.port}, ${context}${small}`;
+}
+
+function describeProxyProviderAuth(provider, state, env = process.env) {
+  if (state === 'ready') {
+    if (provider === LOCAL_PROVIDER) return describeLocalServer();
+    return provider === 'opencode' ? 'API key present' : 'authenticated';
+  }
+  const reason = proxyProviderReason(state, provider, providerLabel(provider), env);
+  if (state === 'backend-down') return `NOT RUNNING (${reason})`;
   if (state === 'auth-missing') return `MISSING (${reason})`;
   return state === 'config-invalid' ? `NOT CONFIGURED (${reason})` : 'status unavailable';
 }
@@ -1731,7 +1801,7 @@ function getProxyProviderReadiness(provider, codexReadiness, { authState = proxy
     state,
     message: state === 'ready'
       ? `${label} readiness confirms local binary, /v1/models, ${proxyProviderCredentialCheck(provider)}, shim, and serving-version checks. It does not prove a streaming request will succeed.`
-      : PROXY_PROVIDER_READINESS_REASONS[state](provider, label),
+      : proxyProviderReason(state, provider, label),
   };
 }
 
@@ -1893,6 +1963,7 @@ async function loadProxyModelRoutes() {
     const routes = parseProxyModelListing(JSON.parse(response.body.toString()).data);
     if (!routes.length) return false;
     setProxyModelRoutes(routes);
+    await refreshLocalServerState(routes, { fetchUrl });
     return true;
   } catch { return false; }
 }
@@ -2972,6 +3043,7 @@ module.exports = {
   catalogReadiness,
   getGrokReadiness,
   describeProxyProviderAuth,
+  localWindowMismatch,
   getProxyProviderReadiness,
   proxyConfigDirectory,
   proxyProviderAuthState,

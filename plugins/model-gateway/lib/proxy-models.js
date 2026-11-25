@@ -16,6 +16,7 @@ const PROVIDER_LABELS = Object.freeze({
   cursor: 'Cursor',
   grok: 'Grok',
   kimi: 'Kimi',
+  local: 'Local GGUF',
   muse: 'Muse',
   opencode: 'OpenCode',
   vertex: 'Vertex AI',
@@ -83,6 +84,20 @@ function advertisedProxyRoutes(routes) {
   return routes.filter(({ id, provider }) => !(provider === 'vertex' && id.startsWith(VERTEX_ID_PREFIX) && vertexIds.has(id.slice(VERTEX_ID_PREFIX.length))));
 }
 
+// claude-code-proxy's local provider forwards local/gguf to a llama.cpp llama-server on
+// 127.0.0.1:$CCP_LLAMA_PORT. Its window is whatever that server was started with, so the last probe
+// of the server (lib/local-llama.js) is kept here beside the route table, where policy resolution
+// reads it without I/O. null means no probe has run in this process.
+let localServer = null;
+
+function setLocalServerState(state) {
+  localServer = state && typeof state === 'object' ? Object.freeze({ ...state }) : null;
+}
+
+function localServerState() {
+  return localServer;
+}
+
 // Codex ids stay routable with no listing at all, as they were before listings were read.
 function proxyModelProvider(backendId) {
   if (typeof backendId !== 'string' || !backendId) return null;
@@ -98,11 +113,13 @@ module.exports = {
   ANTHROPIC_STYLE_ALIAS_RE,
   CODEX_FAMILY_RE,
   advertisedProxyRoutes,
+  localServerState,
   modelsFileRoutes,
   parseProxyModelListing,
   providerLabel,
   proxyModelDisplayName,
   proxyModelProvider,
   proxyModelRoutes,
+  setLocalServerState,
   setProxyModelRoutes,
 };

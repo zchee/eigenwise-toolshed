@@ -33,6 +33,7 @@ const PROXY_LISTING = [
   ['opencode-go/kimi-k2.6', 'opencode'],
   ['gemini-4-argon', 'vertex'],
   ['vertex/anthropic/claude-opus-5-5', 'vertex'],
+  ['vertex/anthropic/claude-fable-5-2', 'vertex'],
   ['vertex/endpoint/my-llm', 'vertex'],
   ['vertex/gemini-4-argon', 'vertex'],
   ['vertex/mistralai/codestral-2', 'vertex'],
@@ -162,6 +163,9 @@ test('the shim advertises every proxy provider row and none of its Claude aliase
     // A Claude model on Vertex AI is a proxy row: the Anthropic-style alias filter reads the
     // proxy's id, which starts with vertex/, not claude-.
     { id: 'claude-vertex/anthropic/claude-opus-5-5[1m]', display_name: 'vertex/anthropic/claude-opus-5-5 (Vertex AI)', type: 'model', max_input_tokens: 1000000 },
+    // Claude Code takes any id containing claude-fable- for its own Fable, so Fable on Vertex is
+    // advertised as fable-; the display name keeps the id the proxy listed.
+    { id: 'claude-vertex/anthropic/fable-5-2[1m]', display_name: 'vertex/anthropic/claude-fable-5-2 (Vertex AI)', type: 'model', max_input_tokens: 1000000 },
     { id: 'claude-vertex/endpoint/my-llm', display_name: 'vertex/endpoint/my-llm (Vertex AI)', type: 'model', max_input_tokens: 200000 },
     { id: 'claude-vertex/mistralai/codestral-2', display_name: 'vertex/mistralai/codestral-2 (Vertex AI)', type: 'model', max_input_tokens: 200000 },
   ]);
@@ -196,6 +200,58 @@ test('only the bare spelling of a Vertex Gemini model is advertised, and only ag
   }
 });
 
+test('a proxy row serving Fable is advertised without the claude-fable- spelling Claude Code reserves', (t) => {
+  const { proxyModelRoutes, setProxyModelRoutes } = require('../lib/proxy-models.js');
+  const { gatewayBackendModelId, gatewayClientModelId, gatewayDiscoveryModels, resolveGatewayModelPolicy } = require('../lib/runtime.js');
+  const saved = proxyModelRoutes();
+  t.after(() => setProxyModelRoutes(saved));
+  const tests = {
+    'success: no listing, a Vertex Fable policy row resolves through its advertised id': {
+      routes: [],
+      cases: [['claude-vertex/anthropic/fable-5-1[1m]', 'vertex/anthropic/claude-fable-5-1', 'claude-vertex/anthropic/fable-5-1[1m]', 'proxy']],
+    },
+    'success: a listed Fable route resolves through both spellings and advertises one': {
+      routes: [['vertex/anthropic/claude-fable-5-2', 'vertex'], ['opencode-go/claude-fable-5', 'opencode']],
+      cases: [
+        ['vertex/anthropic/claude-fable-5-2', 'vertex/anthropic/claude-fable-5-2', 'claude-vertex/anthropic/fable-5-2[1m]', 'proxy'],
+        ['claude-vertex/anthropic/fable-5-2[1m]', 'vertex/anthropic/claude-fable-5-2', 'claude-vertex/anthropic/fable-5-2[1m]', 'proxy'],
+        ['claude-vertex/anthropic/claude-fable-5-2[1m]', 'vertex/anthropic/claude-fable-5-2', 'claude-vertex/anthropic/fable-5-2[1m]', 'proxy'],
+        ['claude-opencode-go/fable-5', 'opencode-go/claude-fable-5', 'claude-opencode-go/fable-5', 'proxy'],
+      ],
+    },
+    'success: native Claude ids and other Vertex Claude rows keep their spelling': {
+      routes: [['vertex/anthropic/claude-opus-5-5', 'vertex']],
+      cases: [
+        ['claude-fable-5-2', 'fable-5-2', 'claude-fable-5-2', 'anthropic'],
+        ['claude-fable-5-1[1m]', 'fable-5-1', 'claude-fable-5-1', 'anthropic'],
+        ['claude-vertex/anthropic/claude-opus-5-5[1m]', 'vertex/anthropic/claude-opus-5-5', 'claude-vertex/anthropic/claude-opus-5-5[1m]', 'proxy'],
+      ],
+    },
+    'success: a listed route spelled like an advertised alias keeps its own spelling': {
+      routes: [['vertex/anthropic/claude-fable-5-2', 'vertex'], ['vertex/anthropic/fable-5-2', 'vertex']],
+      cases: [
+        ['claude-vertex/anthropic/fable-5-2', 'vertex/anthropic/fable-5-2', 'claude-vertex/anthropic/fable-5-2', 'proxy'],
+        ['vertex/anthropic/claude-fable-5-2', 'vertex/anthropic/claude-fable-5-2', 'claude-vertex/anthropic/claude-fable-5-2[1m]', 'proxy'],
+      ],
+    },
+  };
+  for (const [name, { routes, cases }] of Object.entries(tests)) {
+    setProxyModelRoutes(routes.map(([id, provider]) => ({ id, provider })));
+    for (const [id, backendId, clientId, transport] of cases) {
+      assert.equal(gatewayBackendModelId(id), backendId, `${name}: ${id} backend`);
+      assert.equal(gatewayClientModelId(id), clientId, `${name}: ${id} picker id`);
+      assert.equal(resolveGatewayModelPolicy(id)?.transport, transport, `${name}: ${id} transport`);
+    }
+  }
+
+  setProxyModelRoutes([{ id: 'vertex/anthropic/claude-fable-5-2', provider: 'vertex' }]);
+  const discovered = gatewayDiscoveryModels([
+    { id: 'claude-vertex/anthropic/claude-fable-5-2[1m]', display_name: 'vertex/anthropic/claude-fable-5-2 (Vertex AI)' },
+  ]);
+  assert.deepEqual(discovered, [{ id: 'claude-vertex/anthropic/fable-5-2[1m]', display_name: 'vertex/anthropic/claude-fable-5-2 (Vertex AI)' }],
+    'the discovery cache Claude Code builds /model from never holds a claude-fable- id for a proxy row');
+});
+
 test('non-Codex rows reach the proxy under their backend id with credentials and plan tools removed', async (t) => {
   const proxy = await listingProxy(t, (body, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -215,6 +271,8 @@ test('non-Codex rows reach the proxy under their backend id with credentials and
     'Vertex Gemini row under its bare id': { model: 'claude-gemini-4-argon[1m]', backend: 'gemini-4-argon' },
     'Vertex Gemini spelling that is listed but not advertised': { model: 'claude-vertex/gemini-4-argon[1m]', backend: 'vertex/gemini-4-argon' },
     'Claude on Vertex goes to the proxy, not to Anthropic, and is filtered like every proxy row': { model: 'claude-vertex/anthropic/claude-opus-5-5[1m]', backend: 'vertex/anthropic/claude-opus-5-5' },
+    'Fable on Vertex under its advertised id': { model: 'claude-vertex/anthropic/fable-5-2[1m]', backend: 'vertex/anthropic/claude-fable-5-2' },
+    'Fable on Vertex under the id the proxy lists, as an older settings file names it': { model: 'claude-vertex/anthropic/claude-fable-5-2[1m]', backend: 'vertex/anthropic/claude-fable-5-2' },
     'Vertex row without a documented window above 200k': { model: 'claude-vertex/mistralai/codestral-2', backend: 'vertex/mistralai/codestral-2' },
     'Vertex deployed endpoint': { model: 'claude-vertex/endpoint/my-llm', backend: 'vertex/endpoint/my-llm' },
   };

@@ -5,7 +5,9 @@ const os = require('node:os');
 const path = require('node:path');
 const grokBackend = require('./grok-backend.js');
 const { writeFileAtomically } = require('./atomic-file.js');
-const { CODEX_FAMILY_RE, lmStudioServerState, localServerState, proxyModelProvider } = require('./proxy-models.js');
+const {
+  CODEX_FAMILY_RE, advertisedProxyModelPart, lmStudioServerState, localServerState, proxyModelProvider, proxyRouteIdForAdvertisedPart,
+} = require('./proxy-models.js');
 const { LOCAL_PROVIDER } = require('./local-llama.js');
 const { LMSTUDIO_MODEL_PREFIX, LMSTUDIO_PROVIDER } = require('./lmstudio.js');
 
@@ -365,8 +367,22 @@ function codexBillingNote(cap, compactAt = null) {
     : `${CODEX_BILLING_RULE}; requests past 272k pay double`;
 }
 
+// A picker id is claude-<advertised spelling>; the spelling differs from the backend id only for
+// routes advertisedProxyModelPart renames. The table's own rows resolve without a live listing.
 function gatewayBackendModelId(id) {
-  return typeof id === 'string' ? id.replace(/\[1m\]$/, '').replace(/^claude-/, '') : '';
+  const part = typeof id === 'string' ? id.replace(/\[1m\]$/, '').replace(/^claude-/, '') : '';
+  if (proxyModelProvider(part)) return part;
+  return proxyRouteIdForAdvertisedPart(part) ?? policyIdForAdvertisedPart(part) ?? part;
+}
+
+let policyIdsByAdvertisedPart = null;
+
+function policyIdForAdvertisedPart(part) {
+  if (Object.hasOwn(MODEL_WINDOW_POLICY, part)) return null;
+  policyIdsByAdvertisedPart ??= new Map(Object.keys(MODEL_WINDOW_POLICY)
+    .filter((policyId) => advertisedProxyModelPart(policyId) !== policyId)
+    .map((policyId) => [advertisedProxyModelPart(policyId), policyId]));
+  return policyIdsByAdvertisedPart.get(part) ?? null;
 }
 
 // claude-code-proxy lists a Codex model's service tiers as suffixed ids (`-fast` for priority,
@@ -467,11 +483,12 @@ function resolveGatewayModelPolicy(id) {
       : null);
   if (!policy) return null;
   const transport = policyTransport(policy);
+  const pickerId = transport === 'proxy' ? advertisedProxyModelPart(backendId) : backendId;
   const pickerAlias = policy.backendId === backendId && policy.pickerAlias
-    ? policy.pickerAlias
+    ? policy.pickerAlias.replace(backendId, pickerId)
     : policy.pickerAliasTemplate
-      ? policy.pickerAliasTemplate.replace('{backendId}', backendId)
-      : `${PREFIX}${backendId}[1m]`;
+      ? policy.pickerAliasTemplate.replace('{backendId}', pickerId)
+      : `${PREFIX}${pickerId}[1m]`;
   return { ...policy, backendId, pickerAlias, transport };
 }
 
@@ -487,7 +504,7 @@ function gatewayClientModelId(id) {
   if (!policy) return id;
   return gatewayAdvertisedWindow(id) > CODEX_UNKNOWN_MODEL_WINDOW
     ? policy.pickerAlias
-    : `${PREFIX}${policy.backendId}`;
+    : `${PREFIX}${policy.transport === 'proxy' ? advertisedProxyModelPart(policy.backendId) : policy.backendId}`;
 }
 
 function codexContextWindow(id) {

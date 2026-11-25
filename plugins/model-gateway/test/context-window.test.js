@@ -291,7 +291,9 @@ test('Vertex AI policy rows carry each documented window above 200k and leave th
   const tests = {
     'Gemini under its bare id': { backendId: 'gemini-4-argon', backendWindow: 1048576, advertised: 1000000 },
     'Gemini under its vertex/ id': { backendId: 'vertex/gemini-3.5-flash-lite', backendWindow: 1048576, advertised: 1000000 },
-    'Claude on Vertex': { backendId: 'vertex/anthropic/claude-fable-5-2', backendWindow: 1000000, advertised: 1000000 },
+    // Claude Code takes any id containing claude-fable- for its own Fable, so this row's picker id
+    // spells the model fable-; the proxy still gets the id it listed.
+    'Claude on Vertex': { backendId: 'vertex/anthropic/claude-fable-5-2', pickerId: 'vertex/anthropic/fable-5-2', backendWindow: 1000000, advertised: 1000000 },
     'Grok 4.7 on Vertex, a window below the [1m] client window': { backendId: 'vertex/xai/grok-4.7', backendWindow: 524288, advertised: 524288 },
     'Grok 4.20 on Vertex, a window above the [1m] client window': { backendId: 'vertex/xai/grok-4.20-non-reasoning', backendWindow: 2000000, advertised: 1000000 },
     'OpenAI on Vertex': { backendId: 'vertex/openai/gpt-6.1-sol', backendWindow: 922000, advertised: 922000 },
@@ -301,16 +303,16 @@ test('Vertex AI policy rows carry each documented window above 200k and leave th
     'Llama 4 Maverick': { backendId: 'vertex/meta/llama-4-maverick-17b-128e-instruct-maas', backendWindow: 524288, advertised: 524288 },
     'Llama 4 Scout': { backendId: 'vertex/meta/llama-4-scout-17b-16e-instruct-maas', backendWindow: 1310720, advertised: 1000000 },
   };
-  for (const [name, { backendId, backendWindow, advertised }] of Object.entries(tests)) {
-    const policy = resolveGatewayModelPolicy(`claude-${backendId}[1m]`);
+  for (const [name, { backendId, pickerId = backendId, backendWindow, advertised }] of Object.entries(tests)) {
+    const policy = resolveGatewayModelPolicy(`claude-${pickerId}[1m]`);
     assert.equal(policy.backend, 'vertex', name);
     assert.equal(policy.transport, 'proxy', `${name}: only claude-code-proxy serves Vertex AI`);
     assert.equal(policy.backendId, backendId, name);
     assert.equal(policy.backendWindow, backendWindow, name);
-    assert.equal(policy.pickerAlias, `claude-${backendId}[1m]`, name);
+    assert.equal(policy.pickerAlias, `claude-${pickerId}[1m]`, name);
     assert.equal(policy.sentry, 'synthetic-413', name);
     assert.match(policy.measurement, /\b2026-11-12\b.*; not a live probe$/, `${name}: the row names its dated source`);
-    assert.equal(gatewayClientModelId(backendId), `claude-${backendId}[1m]`, `${name}: a window above 200k takes the [1m] alias`);
+    assert.equal(gatewayClientModelId(backendId), `claude-${pickerId}[1m]`, `${name}: a window above 200k takes the [1m] alias`);
     assert.equal(gatewayModel(backendId, 'vertex').max_input_tokens, advertised, `${name}: never advertised above the [1m] client window`);
     assert.equal(effectiveSentryPolicy(policy).compactTrigger, backendWindow - 40000, `${name}: the sentry keeps one turn of headroom`);
   }

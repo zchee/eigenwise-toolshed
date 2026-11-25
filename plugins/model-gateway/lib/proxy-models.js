@@ -64,11 +64,44 @@ function modelsFileRoutes(value) {
 // CLI loads it from the proxy before it builds a catalog, so resolving an id never needs I/O.
 const proxyRoutes = new Map();
 
+// Claude Code takes every model id containing "claude-fable-" for its own Fable: such a row fills
+// the /model Fable slot, Claude Code then leaves its native Fable row out, and a second row for the
+// same Fable version is merged away. A proxy route serving Fable through another provider
+// (vertex/anthropic/claude-fable-5-2) is therefore advertised with that part spelled "fable-".
+const CLAUDE_FABLE_ID_PART = 'claude-fable-';
+const ADVERTISED_FABLE_ID_PART = 'fable-';
+
+function renamedProxyModelPart(backendId) {
+  return backendId.replaceAll(CLAUDE_FABLE_ID_PART, ADVERTISED_FABLE_ID_PART);
+}
+
+// A rename that would take another listed route's id is skipped, so no two rows share a picker id.
+function advertisedProxyModelPart(backendId) {
+  if (typeof backendId !== 'string') return backendId;
+  const renamed = renamedProxyModelPart(backendId);
+  return renamed !== backendId && proxyRoutes.has(renamed) ? backendId : renamed;
+}
+
+// Advertised spelling -> route id, for the routes whose spelling changes.
+const routeIdsByAdvertisedPart = new Map();
+
 function setProxyModelRoutes(routes) {
   proxyRoutes.clear();
+  routeIdsByAdvertisedPart.clear();
   for (const route of Array.isArray(routes) ? routes : []) {
     if (route && typeof route.id === 'string' && typeof route.provider === 'string') proxyRoutes.set(route.id, route.provider);
   }
+  for (const id of proxyRoutes.keys()) {
+    const advertised = advertisedProxyModelPart(id);
+    if (advertised !== id) routeIdsByAdvertisedPart.set(advertised, id);
+  }
+}
+
+// The route id behind an advertised spelling, or null when the spelling is not an advertised alias.
+// The route's own spelling is not an alias, so a settings file that still names it keeps routing.
+function proxyRouteIdForAdvertisedPart(part) {
+  if (typeof part !== 'string' || proxyRoutes.has(part)) return null;
+  return routeIdsByAdvertisedPart.get(part) ?? null;
 }
 
 function proxyModelRoutes() {
@@ -126,6 +159,7 @@ function proxyModelDisplayName(id, provider) {
 module.exports = {
   ANTHROPIC_STYLE_ALIAS_RE,
   CODEX_FAMILY_RE,
+  advertisedProxyModelPart,
   advertisedProxyRoutes,
   lmStudioServerState,
   localServerState,
@@ -135,6 +169,7 @@ module.exports = {
   proxyModelDisplayName,
   proxyModelProvider,
   proxyModelRoutes,
+  proxyRouteIdForAdvertisedPart,
   setLmStudioServerState,
   setLocalServerState,
   setProxyModelRoutes,
